@@ -16,7 +16,9 @@ logger = logging.getLogger(__name__)
 # NOTE: open-notify.org was removed — it is HTTP-only, returns no altitude or
 # velocity, and has been unreliably reachable since early 2026.
 # N2YO is added dynamically in get_fix() when a key is configured.
-FALLBACK_APIS: list[str] = []
+FALLBACK_APIS: list[str] = [
+    "http://api.open-notify.org/iss-now.json",
+]
 
 # N2YO ISS position endpoint.  Observer coords 0/0/0 are ignored when only
 # the satellite geocoords (satlatitude/satlongitude/sataltitude) are consumed.

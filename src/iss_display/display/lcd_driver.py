@@ -91,6 +91,9 @@ class ST7796S:
         # Pre-allocated single-byte buffers: avoid per-call list allocation in command()/data()
         self._cmd_buf = bytearray(1)
         self._dat_buf = bytearray(1)
+        # Pre-allocated 4-byte buffers for CASET/RASET window commands
+        self._caset_data = bytearray(4)
+        self._raset_data = bytearray(4)
 
         # Set to True by _recover() so LcdDisplay.maybe_run_maintenance() can force a full frame
         self.reinit_occurred = False
@@ -320,19 +323,23 @@ class ST7796S:
         logger.info("_fill: SPI write complete")
 
     def set_window(self, x0, y0, x1, y1):
-        # CASET — send command then 4 data bytes in one burst (5 SPI calls vs 11)
+        # CASET — send command then 4 data bytes in one burst
         self._cmd_buf[0] = CASET
         GPIO.output(self.dc, GPIO.LOW)
         self.spi.writebytes2(self._cmd_buf)
         GPIO.output(self.dc, GPIO.HIGH)
-        self.spi.writebytes2(bytes([x0 >> 8, x0 & 0xFF, x1 >> 8, x1 & 0xFF]))
+        d = self._caset_data
+        d[0] = x0 >> 8; d[1] = x0 & 0xFF; d[2] = x1 >> 8; d[3] = x1 & 0xFF
+        self.spi.writebytes2(d)
 
         # RASET
         self._cmd_buf[0] = RASET
         GPIO.output(self.dc, GPIO.LOW)
         self.spi.writebytes2(self._cmd_buf)
         GPIO.output(self.dc, GPIO.HIGH)
-        self.spi.writebytes2(bytes([y0 >> 8, y0 & 0xFF, y1 >> 8, y1 & 0xFF]))
+        d = self._raset_data
+        d[0] = y0 >> 8; d[1] = y0 & 0xFF; d[2] = y1 >> 8; d[3] = y1 & 0xFF
+        self.spi.writebytes2(d)
 
         # RAMWR
         self._cmd_buf[0] = RAMWR
@@ -485,6 +492,18 @@ class LcdDisplay:
         self._prev_frame_idx: Optional[int] = None
         self._prev_marker_bbox: Optional[Tuple[int, int, int, int]] = None  # (x0, y0, x1, y1)
         self._force_full_frame: bool = True  # first frame is always a full write
+
+        # Pre-allocated marker drawing buffers (avoids per-frame numpy allocations)
+        m = THEME.marker
+        max_marker_r = int(m.outer_ring_radius * m.max_size_scale) + 1
+        max_marker_dim = 2 * max_marker_r + 1
+        # Pre-compute full distance-squared grid centered at origin (used via slicing)
+        _dy = np.arange(-max_marker_r, max_marker_r + 1, dtype=np.int32)
+        _dx = np.arange(-max_marker_r, max_marker_r + 1, dtype=np.int32)
+        self._marker_dist_sq_full = _dy[:, None] ** 2 + _dx[None, :] ** 2
+        self._marker_max_r = max_marker_r
+        self._marker_color_buf = np.zeros((max_marker_dim, max_marker_dim), dtype=np.uint16)
+        self._marker_mask = np.zeros((max_marker_dim, max_marker_dim), dtype=np.bool_)
 
         # HUD setup
         self._init_hud()
@@ -979,6 +998,9 @@ class LcdDisplay:
         Draws concentric glow rings + core + center dot.
         Returns the (x0, y0, x1, y1) bounding box of the painted region so the
         caller can erase it on the next partial update.
+
+        Uses pre-allocated arrays (_marker_dist_sq_full, _marker_color_buf,
+        _marker_mask) to avoid per-frame numpy allocations that cause GC jitter.
         """
         m = THEME.marker
         size_scale = m.min_size_scale + (m.max_size_scale - m.min_size_scale) * opacity
@@ -1003,14 +1025,17 @@ class LcdDisplay:
         max_r = int(m.outer_ring_radius * size_scale) + 1
         x0 = max(0, px - max_r);  x1 = min(self.width - 1,  px + max_r)
         y0 = max(0, py - max_r);  y1 = min(self.height - 1, py + max_r)
+        h_bb = y1 - y0 + 1
+        w_bb = x1 - x0 + 1
 
-        # Distance-squared grid for the bounding box
-        dy = np.arange(y0 - py, y1 - py + 1, dtype=np.int32)
-        dx = np.arange(x0 - px, x1 - px + 1, dtype=np.int32)
-        dist_sq = dy[:, None] ** 2 + dx[None, :] ** 2   # shape (h_bb, w_bb)
+        # Slice pre-computed distance-squared grid (no allocation)
+        dy_start = (y0 - py) + self._marker_max_r
+        dx_start = (x0 - px) + self._marker_max_r
+        dist_sq = self._marker_dist_sq_full[dy_start:dy_start + h_bb, dx_start:dx_start + w_bb]
 
-        # Color buffer for bounding box (big-endian uint16; 0 = background / untouched)
-        color_buf = np.zeros((y1 - y0 + 1, x1 - x0 + 1), dtype=np.uint16)
+        # Reuse pre-allocated color buffer (zero the needed region)
+        color_buf = self._marker_color_buf[:h_bb, :w_bb]
+        color_buf[:] = 0
 
         # Paint outermost → innermost so inner shapes overwrite outer ones
         for ring_r_sq, ring_color in rings:
@@ -1020,8 +1045,9 @@ class LcdDisplay:
             color_buf[dist_sq <= 1] = center_color
 
         # Write only non-zero pixels into the shared frame-buffer numpy view
-        drawn = color_buf != 0
-        self._frame_buf_np[y0:y1 + 1, x0:x1 + 1][drawn] = color_buf[drawn]
+        mask = self._marker_mask[:h_bb, :w_bb]
+        np.not_equal(color_buf, 0, out=mask)
+        self._frame_buf_np[y0:y1 + 1, x0:x1 + 1][mask] = color_buf[mask]
 
         return (x0, y0, x1, y1)
 

@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import os
 import socket
 import sys
 import time
 import signal
-from collections import deque
-from dataclasses import dataclass
 from typing import Sequence, Optional
 import threading
 
@@ -36,6 +35,12 @@ _THREAD_STALE_SEC = 120.0
 
 # Data staleness: if no successful fetch in this many seconds, force restart
 _MAX_DATA_AGE_SEC = 600.0
+
+# Manual GC interval (seconds) — replaces automatic GC to avoid random pauses
+_GC_INTERVAL_SEC = 5.0
+
+# Render thread: consider stuck if no heartbeat for this long
+_RENDER_STALE_SEC = 10.0
 
 
 def configure_logging(level: str) -> None:
@@ -250,6 +255,8 @@ class ISSOrbitInterpolator:
         """Background loop that fetches periodically with exponential backoff."""
         while self._running:
             try:
+                self._thread_heartbeat = time.monotonic()
+
                 # Exponential backoff: 30s → 60s max
                 if self._consecutive_failures > 0:
                     backoff = min(
@@ -268,6 +275,79 @@ class ISSOrbitInterpolator:
                 time.sleep(5.0)
 
 
+class DisplayRenderer(threading.Thread):
+    """Dedicated thread for smooth globe rotation rendering.
+
+    Isolates all display I/O (SPI writes, GPIO) from the main thread so that
+    housekeeping work (GC, watchdog, telemetry fetching) cannot delay frame
+    delivery.  Uses globe-frame-aligned sleep to wake up within ~2 ms of each
+    frame transition rather than a fixed-interval poll.
+    """
+
+    def __init__(self, lcd_display: LcdDisplay):
+        super().__init__(daemon=True, name="display-renderer")
+        self._lcd = lcd_display
+        self._running = True
+        self._lock = threading.Lock()
+        self._telemetry: Optional[ISSFix] = None
+        self.heartbeat: float = time.monotonic()
+        self._consecutive_errors = 0
+
+    def set_telemetry(self, telemetry: ISSFix):
+        """Update the telemetry snapshot read by the render loop."""
+        with self._lock:
+            self._telemetry = telemetry
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        lcd = self._lcd
+        frame_period = lcd._rotation_period / lcd.num_frames
+
+        while self._running:
+            # Read latest telemetry (brief lock)
+            with self._lock:
+                telemetry = self._telemetry
+
+            if telemetry is not None:
+                try:
+                    lcd.update_with_telemetry(telemetry)
+                    self._consecutive_errors = 0
+                except Exception as e:
+                    self._consecutive_errors += 1
+                    logger.error(f"Render error ({self._consecutive_errors}x): {e}")
+
+                    if self._consecutive_errors >= _EXIT_AFTER_ERRORS:
+                        logger.critical(
+                            f"{self._consecutive_errors} consecutive render errors, "
+                            f"exiting for systemd restart"
+                        )
+                        sys.exit(1)
+                    elif self._consecutive_errors >= _REINIT_AFTER_ERRORS:
+                        logger.warning(
+                            f"{self._consecutive_errors} consecutive errors, "
+                            f"attempting display re-init"
+                        )
+                        try:
+                            lcd.reinit()
+                        except Exception as reinit_err:
+                            logger.error(f"Display re-init failed: {reinit_err}")
+
+            # Maintenance runs here — on the render thread so it has safe
+            # SPI/GPIO access, and between frames where there is spare time.
+            lcd.maybe_run_maintenance()
+            self.heartbeat = time.monotonic()
+
+            # Smart sleep: align wake-up with the next globe frame change
+            # so frame transitions are detected within ~2 ms.
+            elapsed = time.time() - lcd._rotation_start_time
+            time_in_frame = elapsed % frame_period
+            time_to_next = frame_period - time_in_frame
+            if time_to_next > 0.003:
+                time.sleep(time_to_next - 0.002)
+
+
 def run_loop(settings: Settings) -> None:
     iss_client = ISSClient(settings)
     driver = LcdDisplay(settings)
@@ -278,10 +358,10 @@ def run_loop(settings: Settings) -> None:
     logger.info("Starting ISS Tracker Display Loop...")
 
     running = True
-    frame_times: deque[float] = deque(maxlen=150)
-    last_fps_log = time.time()
-    consecutive_errors = 0
     last_thread_check = time.monotonic()
+    last_gc_collect = time.monotonic()
+
+    renderer = DisplayRenderer(driver)
 
     def signal_handler(sig, frame):
         nonlocal running
@@ -291,62 +371,55 @@ def run_loop(settings: Settings) -> None:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    # Disable automatic GC to prevent unpredictable pauses during rendering.
+    # We collect manually every few seconds at safe points instead.
+    gc.disable()
+    gc.collect()
+    logger.info("Automatic GC disabled; manual collection enabled")
+
     try:
         telemetry = interpolator.get_telemetry()
         logger.info(f"Initial ISS Position: Lat {telemetry.latitude:.2f}, Lon {telemetry.longitude:.2f}")
+        renderer.set_telemetry(telemetry)
+        renderer.start()
 
         _sd_notify("READY=1")
 
         while running:
-            frame_start = time.time()
-
-            # Watchdog ping — tells systemd we're alive
             _sd_notify("WATCHDOG=1")
 
-            try:
-                telemetry = interpolator.get_telemetry()
-                driver.update_with_telemetry(telemetry)
-                consecutive_errors = 0
-            except Exception as e:
-                consecutive_errors += 1
-                logger.error(f"Render error ({consecutive_errors}x): {e}")
+            # Feed latest telemetry to the render thread
+            telemetry = interpolator.get_telemetry()
+            renderer.set_telemetry(telemetry)
 
-                if consecutive_errors >= _EXIT_AFTER_ERRORS:
-                    logger.critical(
-                        f"{consecutive_errors} consecutive render errors, "
-                        f"exiting for systemd restart"
-                    )
-                    sys.exit(1)
-                elif consecutive_errors >= _REINIT_AFTER_ERRORS:
-                    logger.warning(f"{consecutive_errors} consecutive errors, attempting display re-init")
-                    try:
-                        driver.reinit()
-                    except Exception as reinit_err:
-                        logger.error(f"Display re-init failed: {reinit_err}")
-
-            # Display maintenance (health checks, periodic re-init) between frames
-            driver.maybe_run_maintenance()
+            now_mono = time.monotonic()
 
             # Check fetch thread health every 30 seconds
-            now_mono = time.monotonic()
             if now_mono - last_thread_check > 30.0:
                 last_thread_check = now_mono
                 interpolator.restart_if_needed()
 
-            frame_time = time.time() - frame_start
-            frame_times.append(frame_time)
+                # Check render thread health
+                if not renderer.is_alive():
+                    logger.critical("Render thread died, exiting for systemd restart")
+                    sys.exit(1)
+                if now_mono - renderer.heartbeat > _RENDER_STALE_SEC:
+                    logger.critical("Render thread stuck, exiting for systemd restart")
+                    sys.exit(1)
 
-            if time.time() - last_fps_log > 5:
-                if frame_times:
-                    avg_frame_time = sum(frame_times) / len(frame_times)
-                    actual_fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
-                    logger.info(f"FPS: {actual_fps:.1f} (frame time: {avg_frame_time*1000:.1f}ms)")
-                last_fps_log = time.time()
+            # Manual GC — safe here because rendering is on its own thread
+            if now_mono - last_gc_collect > _GC_INTERVAL_SEC:
+                last_gc_collect = now_mono
+                gc.collect()
 
+            time.sleep(0.100)
 
     finally:
+        gc.enable()
         logger.info("Cleaning up...")
         _sd_notify("STOPPING=1")
+        renderer.stop()
+        renderer.join(timeout=2.0)
         interpolator.stop()
         driver.close()
         logger.info("Done.")
