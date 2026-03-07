@@ -11,7 +11,7 @@
 
 [globe]
 scale               = 0.70
-iss_orbit_scale     = 1.10
+iss_orbit_scale     = 1.20
 num_frames          = 144
 rotation_period_sec = 14.0
 

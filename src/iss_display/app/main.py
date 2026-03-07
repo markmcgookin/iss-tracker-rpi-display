@@ -36,9 +36,6 @@ _THREAD_STALE_SEC = 120.0
 # Data staleness: if no successful fetch in this many seconds, force restart
 _MAX_DATA_AGE_SEC = 600.0
 
-# Manual GC interval (seconds) — replaces automatic GC to avoid random pauses
-_GC_INTERVAL_SEC = 5.0
-
 # Render thread: consider stuck if no heartbeat for this long
 _RENDER_STALE_SEC = 10.0
 
@@ -306,6 +303,21 @@ class DisplayRenderer(threading.Thread):
         frame_period = lcd._rotation_period / lcd.num_frames
 
         while self._running:
+            # Wait for the next globe frame boundary using hybrid sleep:
+            # coarse time.sleep() for most of the wait, then busy-wait
+            # for the final ms to get sub-ms precision on the Pi 3.
+            now = time.time()
+            elapsed = now - lcd._rotation_start_time
+            time_in_frame = elapsed % frame_period
+            time_to_next = frame_period - time_in_frame
+
+            if time_to_next > 0.008:
+                time.sleep(time_to_next - 0.006)
+
+            target = now + time_to_next
+            while time.time() < target:
+                pass  # busy-wait for precise frame alignment
+
             # Read latest telemetry (brief lock)
             with self._lock:
                 telemetry = self._telemetry
@@ -334,18 +346,10 @@ class DisplayRenderer(threading.Thread):
                         except Exception as reinit_err:
                             logger.error(f"Display re-init failed: {reinit_err}")
 
-            # Maintenance runs here — on the render thread so it has safe
-            # SPI/GPIO access, and between frames where there is spare time.
+            # Maintenance runs between frames where there is spare time.
+            # Needs to be on the render thread for safe SPI/GPIO access.
             lcd.maybe_run_maintenance()
             self.heartbeat = time.monotonic()
-
-            # Smart sleep: align wake-up with the next globe frame change
-            # so frame transitions are detected within ~2 ms.
-            elapsed = time.time() - lcd._rotation_start_time
-            time_in_frame = elapsed % frame_period
-            time_to_next = frame_period - time_in_frame
-            if time_to_next > 0.003:
-                time.sleep(time_to_next - 0.002)
 
 
 def run_loop(settings: Settings) -> None:
@@ -359,7 +363,6 @@ def run_loop(settings: Settings) -> None:
 
     running = True
     last_thread_check = time.monotonic()
-    last_gc_collect = time.monotonic()
 
     renderer = DisplayRenderer(driver)
 
@@ -371,11 +374,12 @@ def run_loop(settings: Settings) -> None:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Disable automatic GC to prevent unpredictable pauses during rendering.
-    # We collect manually every few seconds at safe points instead.
+    # Disable automatic GC to prevent unpredictable stop-the-world pauses
+    # that block ALL threads (including the render thread) via the GIL.
+    # With pre-allocated arrays, reference counting handles most cleanup.
     gc.disable()
-    gc.collect()
-    logger.info("Automatic GC disabled; manual collection enabled")
+    gc.collect()  # one clean sweep before starting
+    logger.info("Automatic GC disabled")
 
     try:
         telemetry = interpolator.get_telemetry()
@@ -406,11 +410,6 @@ def run_loop(settings: Settings) -> None:
                 if now_mono - renderer.heartbeat > _RENDER_STALE_SEC:
                     logger.critical("Render thread stuck, exiting for systemd restart")
                     sys.exit(1)
-
-            # Manual GC — safe here because rendering is on its own thread
-            if now_mono - last_gc_collect > _GC_INTERVAL_SEC:
-                last_gc_collect = now_mono
-                gc.collect()
 
             time.sleep(0.100)
 
