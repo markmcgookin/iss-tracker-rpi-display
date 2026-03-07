@@ -25,6 +25,8 @@ coastline_width     = 0.5
 grid_color          = [255, 255, 255]   # White
 grid_width          = 0.3
 grid_alpha          = 0.4
+grid_lat_spacing    = 30               # Degrees between latitude lines
+grid_lon_spacing    = 30               # Degrees between longitude lines
 
 
 # ── ISS Marker (glowing dot on globe) ────────────────────────────────────
@@ -45,8 +47,7 @@ ring_brightness_step = 40
 min_size_scale      = 0.6
 max_size_scale      = 1.0
 
-center_dot_opacity_threshold = 0.5
-fade_start          = 0.05
+fade_start          = 0.35
 opacity_cutoff      = 0.05
 occlusion_factor    = 0.3
 

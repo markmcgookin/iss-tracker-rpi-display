@@ -25,14 +25,17 @@ ISS_ORBITAL_PERIOD_SEC = 92.68 * 60  # ~92.68 minutes per orbit
 
 # API backoff limits
 _BACKOFF_BASE = 30.0
-_BACKOFF_MAX = 300.0
+_BACKOFF_MAX = 60.0
 
 # Error recovery thresholds
 _REINIT_AFTER_ERRORS = 5
 _EXIT_AFTER_ERRORS = 20
 
-# Thread health: consider stale after 5 minutes without update
-_THREAD_STALE_SEC = 300.0
+# Thread health: consider stale after 2 minutes without a successful fetch
+_THREAD_STALE_SEC = 120.0
+
+# Data staleness: if no successful fetch in this many seconds, force restart
+_MAX_DATA_AGE_SEC = 600.0
 
 
 def configure_logging(level: str) -> None:
@@ -118,10 +121,17 @@ class ISSOrbitInterpolator:
         )
 
     def is_healthy(self) -> bool:
-        """Check if the fetch thread is alive and responsive."""
+        """Check if the fetch thread is alive, responsive, and delivering data."""
         if self._thread is None or not self._thread.is_alive():
+            logger.debug("Health check: thread dead")
             return False
         if time.monotonic() - self._thread_heartbeat > _THREAD_STALE_SEC:
+            logger.debug("Health check: heartbeat stale (%.0fs)",
+                         time.monotonic() - self._thread_heartbeat)
+            return False
+        if self._last_fetch_time > 0 and time.time() - self._last_fetch_time > _MAX_DATA_AGE_SEC:
+            logger.debug("Health check: data stale (%.0fs)",
+                         time.time() - self._last_fetch_time)
             return False
         return True
 
@@ -129,10 +139,16 @@ class ISSOrbitInterpolator:
         """Restart the fetch thread if it has died. Returns True if restarted."""
         if self.is_healthy():
             return False
-        logger.warning("Fetch thread is dead or stale, restarting...")
+        logger.warning(
+            "Fetch thread unhealthy, restarting (failures=%d, data_age=%.0fs)",
+            self._consecutive_failures,
+            time.time() - self._last_fetch_time if self._last_fetch_time > 0 else -1,
+        )
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
+        self._consecutive_failures = 0
+        self.client.reset_session()
         self.start()
         return True
 
@@ -208,6 +224,7 @@ class ISSOrbitInterpolator:
                         )
 
             self._consecutive_failures = 0
+            self._thread_heartbeat = time.monotonic()
             logger.debug(f"API fetch #{self._api_calls}: Lat {fix.latitude:.2f}, Lon {fix.longitude:.2f}")
 
         except ISSFetchError as e:
@@ -233,9 +250,7 @@ class ISSOrbitInterpolator:
         """Background loop that fetches periodically with exponential backoff."""
         while self._running:
             try:
-                self._thread_heartbeat = time.monotonic()
-
-                # Exponential backoff: 30s → 60s → 120s → 300s max
+                # Exponential backoff: 30s → 60s max
                 if self._consecutive_failures > 0:
                     backoff = min(
                         _BACKOFF_BASE * (2 ** (self._consecutive_failures - 1)),
@@ -328,8 +343,6 @@ def run_loop(settings: Settings) -> None:
                     logger.info(f"FPS: {actual_fps:.1f} (frame time: {avg_frame_time*1000:.1f}ms)")
                 last_fps_log = time.time()
 
-            # Brief idle window for display controller refresh scan
-            time.sleep(0.002)
 
     finally:
         logger.info("Cleaning up...")

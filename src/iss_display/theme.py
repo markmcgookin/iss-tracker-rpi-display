@@ -66,6 +66,8 @@ class GlobeStyle:
     grid_color: RGB = (255, 255, 255)
     grid_width: float = 0.3
     grid_alpha: float = 0.5
+    grid_lat_spacing: int = 30
+    grid_lon_spacing: int = 30
 
 
 # ── ISS Marker ────────────────────────────────────────────────────────────
@@ -94,11 +96,8 @@ class MarkerStyle:
     min_size_scale: float = 0.6            # Marker size at minimum visibility
     max_size_scale: float = 1.0            # Marker size at full visibility
 
-    # Center dot
-    center_dot_opacity_threshold: float = 0.5  # Show center dot only above this opacity
-
     # Visibility thresholds
-    fade_start: float = 0.05              # cos_c below which fade begins
+    fade_start: float = 0.35              # cos_c below which fade begins
     opacity_cutoff: float = 0.05          # Below this, marker is hidden
     occlusion_factor: float = 0.3         # Opacity multiplier when behind Earth
 

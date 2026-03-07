@@ -50,6 +50,15 @@ class ISSClient:
         self._session = requests.Session()
         self._last_fix: Optional[ISSFix] = None
 
+    def reset_session(self) -> None:
+        """Close and recreate the HTTP session (clears stale connection pool)."""
+        try:
+            self._session.close()
+        except Exception:
+            pass
+        self._session = requests.Session()
+        logger.info("HTTP session recycled")
+
     def _build_api_list(self) -> list[str]:
         """Return the ordered list of URLs to try, including optional N2YO."""
         urls = [self._settings.iss_api_url] + FALLBACK_APIS

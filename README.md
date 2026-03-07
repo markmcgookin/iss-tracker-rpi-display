@@ -18,7 +18,15 @@ Self-contained Python application that fetches real-time ISS telemetry, renders 
 ### Software Requirements
 
 - Python 3.11+ (uses `tomllib` from stdlib)
-- System packages: `libopenjp2-7`, `libtiff6`, etc. (installed automatically on Raspberry Pi OS).
+- System packages (install before `pip install`):
+  ```bash
+  sudo apt install libgeos-dev libproj-dev python3-dev swig liblgpio-dev fonts-b612
+  ```
+- SPI buffer size must be increased from the 4096-byte default to fit a full frame (320×480×2 = 307,200 bytes). Without this the display will freeze after a few seconds:
+  ```bash
+  echo 'options spidev bufsiz=307200' | sudo tee /etc/modprobe.d/spidev.conf
+  sudo reboot  # or: sudo rmmod spidev && sudo modprobe spidev bufsiz=307200
+  ```
 - Python dependencies listed in `pyproject.toml` (install via `pip install -e .`).
 
 ---

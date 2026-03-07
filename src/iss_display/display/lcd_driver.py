@@ -88,6 +88,13 @@ class ST7796S:
         self._health_check_supported = True  # disabled if readback returns all zeros
         self._health_check_zero_count = 0
 
+        # Pre-allocated single-byte buffers: avoid per-call list allocation in command()/data()
+        self._cmd_buf = bytearray(1)
+        self._dat_buf = bytearray(1)
+
+        # Set to True by _recover() so LcdDisplay.maybe_run_maintenance() can force a full frame
+        self.reinit_occurred = False
+
         self._init_gpio()
         self._init_spi()
         self._init_display(first_boot=True)
@@ -119,13 +126,16 @@ class ST7796S:
 
     def command(self, cmd: int):
         GPIO.output(self.dc, GPIO.LOW)
-        self.spi.writebytes([cmd])
+        self._cmd_buf[0] = cmd
+        self.spi.writebytes2(self._cmd_buf)
 
-    def data(self, data: int):
+    def data(self, val: int):
         GPIO.output(self.dc, GPIO.HIGH)
-        self.spi.writebytes([data])
+        self._dat_buf[0] = val
+        self.spi.writebytes2(self._dat_buf)
 
     def _init_display(self, *, first_boot: bool = False):
+        logger.info("Display init: hardware reset")
         self._reset()
 
         self.command(SWRESET)
@@ -133,6 +143,7 @@ class ST7796S:
 
         self.command(SLPOUT)
         time.sleep(0.15)
+        logger.info("Display init: SWRESET + SLPOUT done")
 
         self.command(COLMOD)
         self.data(0x55)  # 16-bit/pixel
@@ -147,12 +158,18 @@ class ST7796S:
         time.sleep(0.01)
 
         self.command(DISPON)
-        time.sleep(0.01)
+        time.sleep(0.12)
+        logger.info("Display init: DISPON done")
 
         self.set_window(0, 0, self.width - 1, self.height - 1)
 
         if first_boot:
             GPIO.output(self.bl, GPIO.HIGH)
+            # Diagnostic: red fill to verify display hardware is responding
+            logger.info("Display init: filling RED test pattern")
+            self._fill(0xF800)  # RGB565 red
+            time.sleep(1.0)
+            logger.info("Display init: filling BLACK")
             self._fill(0x0000)
 
         now = time.monotonic()
@@ -165,10 +182,11 @@ class ST7796S:
     def _light_reinit(self):
         """Reaffirm critical controller registers without sleep/wake transitions.
 
-        Only sends stateless register-write commands that correct potential
-        drift without triggering display blanking. SLPOUT, NORON, and DISPON
-        are intentionally omitted — they are no-ops on an already-awake display
-        but can cause brief visual artifacts on some ST7796S modules.
+        Re-sends all stateless register-write commands (including extended
+        panel config) that correct potential drift without triggering display
+        blanking.  SLPOUT, NORON, and DISPON are intentionally omitted — they
+        are no-ops on an already-awake display but can cause brief visual
+        artifacts on some ST7796S modules.
         """
         try:
             self.command(COLMOD)
@@ -241,8 +259,11 @@ class ST7796S:
             logger.warning(f"Display health check read failed: {e}")
             return False
 
-    def _periodic_maintenance(self):
-        """Run periodic health checks and re-initialization."""
+    def _periodic_maintenance(self) -> bool:
+        """Run periodic health checks and re-initialization.
+
+        Returns True if a re-init occurred (caller should force a full frame).
+        """
         now = time.monotonic()
 
         # Health check every 60 seconds
@@ -250,16 +271,19 @@ class ST7796S:
             if not self._check_health():
                 logger.warning("Health check triggered re-init")
                 self._full_reinit()
-                return
+                return True
 
         # Full re-init every 60 minutes
         if now - self._last_full_reinit >= _FULL_REINIT_INTERVAL_SEC:
             self._full_reinit()
-            return
+            return True
 
         # Light re-init every 15 minutes
         if now - self._last_light_reinit >= _LIGHT_REINIT_INTERVAL_SEC:
             self._light_reinit()
+            return True
+
+        return False
 
     def _recover(self):
         """Attempt to recover SPI bus and display from a failed state."""
@@ -278,6 +302,7 @@ class ST7796S:
                 self._reset()
                 time.sleep(0.2)
             self._init_display()
+            self.reinit_occurred = True  # signal LcdDisplay to force a full frame
             logger.info("SPI/display recovery successful")
         except Exception as e:
             logger.error(f"Recovery failed: {e}")
@@ -288,23 +313,31 @@ class ST7796S:
         high = (color >> 8) & 0xFF
         low = color & 0xFF
         pixel_data = bytes([high, low] * (self.width * self.height))
+        logger.info(f"_fill: color=0x{color:04X}, {len(pixel_data)} bytes, "
+                    f"DC pin will be set HIGH")
         GPIO.output(self.dc, GPIO.HIGH)
         self.spi.writebytes2(pixel_data)
+        logger.info("_fill: SPI write complete")
 
     def set_window(self, x0, y0, x1, y1):
-        self.command(CASET)
-        self.data(x0 >> 8)
-        self.data(x0 & 0xFF)
-        self.data(x1 >> 8)
-        self.data(x1 & 0xFF)
+        # CASET — send command then 4 data bytes in one burst (5 SPI calls vs 11)
+        self._cmd_buf[0] = CASET
+        GPIO.output(self.dc, GPIO.LOW)
+        self.spi.writebytes2(self._cmd_buf)
+        GPIO.output(self.dc, GPIO.HIGH)
+        self.spi.writebytes2(bytes([x0 >> 8, x0 & 0xFF, x1 >> 8, x1 & 0xFF]))
 
-        self.command(RASET)
-        self.data(y0 >> 8)
-        self.data(y0 & 0xFF)
-        self.data(y1 >> 8)
-        self.data(y1 & 0xFF)
+        # RASET
+        self._cmd_buf[0] = RASET
+        GPIO.output(self.dc, GPIO.LOW)
+        self.spi.writebytes2(self._cmd_buf)
+        GPIO.output(self.dc, GPIO.HIGH)
+        self.spi.writebytes2(bytes([y0 >> 8, y0 & 0xFF, y1 >> 8, y1 & 0xFF]))
 
-        self.command(RAMWR)
+        # RAMWR
+        self._cmd_buf[0] = RAMWR
+        GPIO.output(self.dc, GPIO.LOW)
+        self.spi.writebytes2(self._cmd_buf)
 
     def display_raw(self, pixel_bytes: Union[bytes, bytearray]):
         """Display pre-converted RGB565 data directly, with error recovery."""
@@ -318,12 +351,30 @@ class ST7796S:
             logger.error(f"SPI write failed ({self._consecutive_failures}x): {e}")
             self._recover()
 
-    def maybe_run_maintenance(self):
+    def display_region(self, x0: int, y0: int, x1: int, y1: int, frame_buf_np: "np.ndarray"):
+        """Send a rectangular sub-region from frame_buf_np to the display.
+
+        Used for partial updates (ISS marker erase/redraw) to avoid sending
+        the full 307 KB frame when only a small area changed.
+        """
+        region_bytes = np.ascontiguousarray(frame_buf_np[y0:y1 + 1, x0:x1 + 1]).tobytes()
+        try:
+            self.set_window(x0, y0, x1, y1)
+            GPIO.output(self.dc, GPIO.HIGH)
+            self.spi.writebytes2(region_bytes)
+            self._consecutive_failures = 0
+        except Exception as e:
+            self._consecutive_failures += 1
+            logger.error(f"SPI region write failed ({self._consecutive_failures}x): {e}")
+            self._recover()
+
+    def maybe_run_maintenance(self) -> bool:
         """Run periodic maintenance if any interval has elapsed.
 
         Call this between frames from the main loop, NOT during frame writes.
+        Returns True if a re-init occurred.
         """
-        self._periodic_maintenance()
+        return self._periodic_maintenance()
 
     def close(self):
         """Properly shut down the display with robust error handling."""
@@ -337,7 +388,6 @@ class ST7796S:
         try:
             black_screen = bytes(self.width * self.height * 2)
             self.set_window(0, 0, self.width - 1, self.height - 1)
-            self.command(RAMWR)
             GPIO.output(self.dc, GPIO.HIGH)
             self.spi.writebytes2(black_screen)
             time.sleep(0.05)
@@ -427,6 +477,14 @@ class LcdDisplay:
 
         # Reusable frame buffer — avoids per-frame allocation
         self._frame_buf = bytearray(self.width * self.height * 2)
+        # Writable big-endian uint16 numpy view of the same memory (zero-copy).
+        # Writes to _frame_buf_np go directly to _frame_buf used by display_raw().
+        self._frame_buf_np = np.frombuffer(self._frame_buf, dtype='>u2').reshape(self.height, self.width)
+
+        # Partial-update state
+        self._prev_frame_idx: Optional[int] = None
+        self._prev_marker_bbox: Optional[Tuple[int, int, int, int]] = None  # (x0, y0, x1, y1)
+        self._force_full_frame: bool = True  # first frame is always a full write
 
         # HUD setup
         self._init_hud()
@@ -438,11 +496,36 @@ class LcdDisplay:
         """Re-initialize the display hardware (called by main loop on persistent errors)."""
         if self.driver:
             self.driver._full_reinit()
+        self.force_full_frame()
 
     def maybe_run_maintenance(self):
-        """Run periodic display maintenance if due (call between frames)."""
+        """Run periodic display maintenance if due (call between frames).
+
+        Forces a full frame on the next update if a re-init occurred, so the
+        display state is guaranteed to be in sync with _frame_buf.
+        """
         if self.driver:
-            self.driver.maybe_run_maintenance()
+            if self.driver.maybe_run_maintenance():
+                self.force_full_frame()
+            # Also pick up reinit_occurred set by _recover() during SPI error handling
+            if self.driver.reinit_occurred:
+                self.driver.reinit_occurred = False
+                self.force_full_frame()
+
+    def display_region(self, x0: int, y0: int, x1: int, y1: int):
+        """Send a rectangular region from _frame_buf_np to the display."""
+        if self.driver:
+            self.driver.display_region(x0, y0, x1, y1, self._frame_buf_np)
+
+    def force_full_frame(self):
+        """Reset partial-update state so the next frame is a full rewrite.
+
+        Call after any display recovery or re-init to guarantee the display
+        and _frame_buf are back in sync.
+        """
+        self._force_full_frame = True
+        self._prev_frame_idx = None
+        self._prev_marker_bbox = None
 
     # ─── HUD ──────────────────────────────────────────────────────────────
 
@@ -514,6 +597,10 @@ class LcdDisplay:
         self._hud_top_bytes: Optional[bytes] = None
         self._hud_bottom_bytes: Optional[bytes] = None
 
+        # Pre-allocated Image objects — reused on every HUD redraw to avoid allocation
+        self._hud_top_img = Image.new('RGB', (self.width, self._hud_top_height), self._hud_bg)
+        self._hud_bot_img = Image.new('RGB', (self.width, self._hud_bot_height), self._hud_bg)
+
     def _get_font(self, font_path: Optional[str], size: int) -> ImageFont.FreeTypeFont:
         """Load a font at a given size, using the cache."""
         path = font_path or self._default_font_path
@@ -554,9 +641,10 @@ class LcdDisplay:
         label_y = self._hud_label_y
         value_y = self._hud_value_y
 
-        # ── Top bar ──
-        top_img = Image.new('RGB', (w, top_h), self._hud_bg)
+        # ── Top bar — reuse pre-allocated Image, clear before drawing ──
+        top_img = self._hud_top_img
         draw = ImageDraw.Draw(top_img)
+        draw.rectangle([0, 0, w, top_h], fill=self._hud_bg)
         draw.line([0, top_h - 1, w, top_h - 1], fill=self._hud_top_border)
 
         # LAT cell
@@ -593,9 +681,10 @@ class LcdDisplay:
             region_text_w = draw.textbbox((0, 0), region, font=over_el.value.font)[2]
             draw.text((right_edge - region_text_w, value_y), region, fill=over_el.value.color, font=over_el.value.font)
 
-        # ── Bottom bar ──
-        bot_img = Image.new('RGB', (w, bot_h), self._hud_bg)
+        # ── Bottom bar — reuse pre-allocated Image, clear before drawing ──
+        bot_img = self._hud_bot_img
         draw = ImageDraw.Draw(bot_img)
+        draw.rectangle([0, 0, w, bot_h], fill=self._hud_bg)
         draw.line([0, 0, w, 0], fill=self._hud_bot_border)
 
         # ALT cell
@@ -646,13 +735,21 @@ class LcdDisplay:
     def _precompute_rgb565(self):
         """Pre-compute RGB565 data for all cached frames.
 
-        Stores both bytes (for direct display) and numpy uint16 arrays
-        (for fast inter-frame blending).
+        Stores bytes (for display_raw) and big-endian numpy uint16 arrays
+        (for np.copyto frame copies and partial-update region extraction).
         """
         logger.info("Pre-computing RGB565 frame data...")
         self.frame_bytes_cache = []
+        self.frame_np_cache: List[np.ndarray] = []
         for frame in self.frame_cache:
-            self.frame_bytes_cache.append(self._image_to_rgb565_bytes(frame))
+            img_np = np.array(frame)
+            r = img_np[..., 0].astype(np.uint16)
+            g = img_np[..., 1].astype(np.uint16)
+            b = img_np[..., 2].astype(np.uint16)
+            rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+            frame_be = rgb565.astype('>u2')
+            self.frame_np_cache.append(frame_be)
+            self.frame_bytes_cache.append(frame_be.tobytes())
         logger.info(f"Pre-computed {len(self.frame_bytes_cache)} frames")
 
     # ─── Frame cache ──────────────────────────────────────────────────────
@@ -709,6 +806,8 @@ class LcdDisplay:
             'grid_color': g.grid_color,
             'grid_width': g.grid_width,
             'grid_alpha': g.grid_alpha,
+            'grid_lat_spacing': g.grid_lat_spacing,
+            'grid_lon_spacing': g.grid_lon_spacing,
         }
 
         degrees_per_frame = 360 / self.num_frames
@@ -797,7 +896,9 @@ class LcdDisplay:
             linewidth=globe_cfg['coastline_width']), zorder=2)
         ax.gridlines(color=rgb_to_hex(globe_cfg['grid_color']),
                       linewidth=globe_cfg['grid_width'],
-                      alpha=globe_cfg['grid_alpha'], linestyle='-')
+                      alpha=globe_cfg['grid_alpha'], linestyle='-',
+                      xlocs=np.arange(-180, 180, globe_cfg['grid_lon_spacing']),
+                      ylocs=np.arange(-90, 91, globe_cfg['grid_lat_spacing']))
         ax.spines['geo'].set_visible(False)
 
         plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
@@ -872,17 +973,17 @@ class LcdDisplay:
 
         return (px, py, opacity)
 
-    def _draw_iss_marker_rgb565(self, frame_buf: bytearray, px: int, py: int, opacity: float):
-        """Draw ISS marker directly into an RGB565 byte buffer.
+    def _draw_iss_marker_rgb565(self, px: int, py: int, opacity: float) -> Tuple[int, int, int, int]:
+        """Draw ISS marker into self._frame_buf_np using NumPy vectorised operations.
 
-        Draws concentric glow rings + core + center dot using direct byte writes.
+        Draws concentric glow rings + core + center dot.
+        Returns the (x0, y0, x1, y1) bounding box of the painted region so the
+        caller can erase it on the next partial update.
         """
         m = THEME.marker
         size_scale = m.min_size_scale + (m.max_size_scale - m.min_size_scale) * opacity
-        w = self.width
 
-        # Pre-compute marker pixel colors at varying radii
-        # Glow rings (outer to inner)
+        # Glow rings: list of (radius_squared, rgb565_color), outermost first
         rings = []
         for i in range(m.ring_count):
             r = int((m.outer_ring_radius - i * m.ring_step) * size_scale)
@@ -895,43 +996,34 @@ class LcdDisplay:
         core_r = max(1, int(m.core_radius * size_scale))
         core_color = _rgb_to_rgb565(int(m.core_color[0] * opacity), 0, 0)
 
-        show_center = opacity > m.center_dot_opacity_threshold
         center_b = int(m.center_color[0] * opacity)
         center_color = _rgb_to_rgb565(center_b, center_b, center_b)
 
-        # Determine bounding box for the marker
+        # Bounding box (clamped to screen)
         max_r = int(m.outer_ring_radius * size_scale) + 1
-        y_start = max(0, py - max_r)
-        y_end = min(self.height - 1, py + max_r)
-        x_start = max(0, px - max_r)
-        x_end = min(self.width - 1, px + max_r)
+        x0 = max(0, px - max_r);  x1 = min(self.width - 1,  px + max_r)
+        y0 = max(0, py - max_r);  y1 = min(self.height - 1, py + max_r)
 
-        for my in range(y_start, y_end + 1):
-            dy = my - py
-            row_offset = my * w * 2
-            for mx in range(x_start, x_end + 1):
-                dx = mx - px
-                dist_sq = dx * dx + dy * dy
+        # Distance-squared grid for the bounding box
+        dy = np.arange(y0 - py, y1 - py + 1, dtype=np.int32)
+        dx = np.arange(x0 - px, x1 - px + 1, dtype=np.int32)
+        dist_sq = dy[:, None] ** 2 + dx[None, :] ** 2   # shape (h_bb, w_bb)
 
-                color = None
+        # Color buffer for bounding box (big-endian uint16; 0 = background / untouched)
+        color_buf = np.zeros((y1 - y0 + 1, x1 - x0 + 1), dtype=np.uint16)
 
-                # Center dot (radius 1)
-                if show_center and dist_sq <= 1:
-                    color = center_color
-                # Core (radius core_r)
-                elif dist_sq <= core_r * core_r:
-                    color = core_color
-                else:
-                    # Check glow rings (outer to inner — outer drawn first, inner overwrites)
-                    for ring_r_sq, ring_color in rings:
-                        if dist_sq <= ring_r_sq:
-                            color = ring_color
-                            break
+        # Paint outermost → innermost so inner shapes overwrite outer ones
+        for ring_r_sq, ring_color in rings:
+            color_buf[dist_sq <= ring_r_sq] = ring_color
+        color_buf[dist_sq <= core_r * core_r] = core_color
+        if center_b > 0:
+            color_buf[dist_sq <= 1] = center_color
 
-                if color is not None:
-                    offset = row_offset + mx * 2
-                    frame_buf[offset] = (color >> 8) & 0xFF
-                    frame_buf[offset + 1] = color & 0xFF
+        # Write only non-zero pixels into the shared frame-buffer numpy view
+        drawn = color_buf != 0
+        self._frame_buf_np[y0:y1 + 1, x0:x1 + 1][drawn] = color_buf[drawn]
+
+        return (x0, y0, x1, y1)
 
     def _patch_hud_bytes(self, frame_buf: bytearray):
         """Patch cached HUD bar bytes into a frame buffer."""
@@ -953,48 +1045,93 @@ class LcdDisplay:
     def update_with_telemetry(self, telemetry: "ISSFix"):
         """Update the display with current ISS telemetry.
 
-        Optimized pipeline:
-        1. Copy pre-computed RGB565 bytes into reusable buffer
-        2. Draw ISS marker directly into byte buffer (small area)
-        3. Patch cached HUD bars into byte buffer (memcpy)
-        4. Send to display
+        Uses a two-path strategy to minimise SPI bandwidth:
+
+        Full update (globe changed, HUD changed, or forced):
+          Copy globe frame → draw marker → patch HUD → send full 307 KB frame.
+
+        Partial update (globe and HUD unchanged):
+          Erase previous marker region from globe cache → draw new marker →
+          send only the two tiny marker bounding-box regions (~1 KB total).
+          This is how the Waveshare driver achieves high effective frame rates
+          at the 48 MHz SPI limit.
         """
         if not self.frames_generated:
             logger.warning("Frames not yet generated")
             return
 
-        # Ensure HUD bars are rendered (only redraws when values change)
-        self._render_hud_bars(telemetry)
-
-        # Select globe frame based on elapsed time (decouples speed from frame count)
+        # Determine current globe frame (time-based, decoupled from FPS)
         elapsed = time.time() - self._rotation_start_time
         rotation_progress = (elapsed % self._rotation_period) / self._rotation_period
         current_frame = int(rotation_progress * self.num_frames) % self.num_frames
+        central_lon = (current_frame * (360.0 / self.num_frames)) - 180.0
 
-        # Copy pre-computed RGB565 bytes into reusable buffer (no allocation)
-        self._frame_buf[:] = self.frame_bytes_cache[current_frame]
+        # Render HUD bars if telemetry changed (returns cache key, cheap when unchanged)
+        old_hud_key = self._hud_cache_key
+        new_hud_key = self._render_hud_bars(telemetry)
+        hud_changed = new_hud_key != old_hud_key
 
-        # Calculate ISS screen position for this frame's view angle
-        central_lon = (current_frame * (360 / self.num_frames)) - 180
+        globe_changed = current_frame != self._prev_frame_idx
         iss_pos = self._calc_iss_screen_pos(telemetry.latitude, telemetry.longitude, central_lon)
 
-        # Draw ISS marker directly into byte buffer
-        if iss_pos is not None:
-            px, py, opacity = iss_pos
-            self._draw_iss_marker_rgb565(self._frame_buf, px, py, opacity)
+        if self._force_full_frame or globe_changed or hud_changed:
+            self._do_full_update(current_frame, iss_pos)
+            self._force_full_frame = False
+        else:
+            self._do_partial_update(current_frame, iss_pos)
 
-        # Patch HUD bars into byte buffer
-        self._patch_hud_bytes(self._frame_buf)
-
-        # Send to display
-        if self.driver:
-            self.driver.display_raw(self._frame_buf)
+        self._prev_frame_idx = current_frame
 
         # Preview mode: save occasional PNGs
         if self.driver is None:
             self._preview_frame_count += 1
             if self._preview_frame_count % 30 == 1:
                 self._save_preview(self._frame_buf)
+
+    def _do_full_update(self, frame_idx: int, iss_pos):
+        """Full-frame update: copy globe, draw marker, patch HUD, send everything."""
+        np.copyto(self._frame_buf_np, self.frame_np_cache[frame_idx])
+
+        new_bbox = None
+        if iss_pos is not None:
+            px, py, opacity = iss_pos
+            new_bbox = self._draw_iss_marker_rgb565(px, py, opacity)
+
+        self._patch_hud_bytes(self._frame_buf)
+
+        if self.driver:
+            self.driver.display_raw(self._frame_buf)
+
+        self._prev_marker_bbox = new_bbox
+
+    def _do_partial_update(self, frame_idx: int, iss_pos):
+        """Partial update: erase old marker, draw new, send union bbox once.
+
+        Uses a single SPI transfer covering both old and new marker regions
+        to prevent flicker from the display briefly showing bare globe.
+        """
+        old_bbox = self._prev_marker_bbox
+
+        # Erase old marker by restoring globe pixels (buffer only, no SPI)
+        if old_bbox is not None:
+            x0, y0, x1, y1 = old_bbox
+            self._frame_buf_np[y0:y1 + 1, x0:x1 + 1] = self.frame_np_cache[frame_idx][y0:y1 + 1, x0:x1 + 1]
+
+        # Draw new marker into buffer
+        new_bbox = None
+        if iss_pos is not None:
+            px, py, opacity = iss_pos
+            new_bbox = self._draw_iss_marker_rgb565(px, py, opacity)
+
+        # Send the union of old and new bounding boxes in one SPI transfer
+        union = old_bbox if new_bbox is None else new_bbox if old_bbox is None else (
+            min(old_bbox[0], new_bbox[0]), min(old_bbox[1], new_bbox[1]),
+            max(old_bbox[2], new_bbox[2]), max(old_bbox[3], new_bbox[3]),
+        )
+        if union is not None:
+            self.display_region(*union)
+
+        self._prev_marker_bbox = new_bbox
 
     def _save_preview(self, pixel_bytes: Union[bytes, bytearray]):
         """Save an RGB565 frame buffer as a PNG preview image."""
