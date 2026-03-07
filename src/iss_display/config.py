@@ -34,6 +34,7 @@ class Settings:
     gpio_dc: int
     gpio_rst: int
     gpio_bl: int
+    gpio_toggle: int
     spi_bus: int
     spi_device: int
     spi_speed_hz: int
@@ -54,6 +55,7 @@ class Settings:
             gpio_dc=int(os.getenv("GPIO_DC", "22")),
             gpio_rst=int(os.getenv("GPIO_RST", "27")),
             gpio_bl=int(os.getenv("GPIO_BL", "18")),
+            gpio_toggle=int(os.getenv("GPIO_TOGGLE", "17")),
             spi_bus=int(os.getenv("SPI_BUS", "0")),
             spi_device=int(os.getenv("SPI_DEVICE", "0")),
             spi_speed_hz=int(os.getenv("SPI_SPEED_HZ", "48000000")),

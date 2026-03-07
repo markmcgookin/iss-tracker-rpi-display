@@ -508,6 +508,9 @@ class LcdDisplay:
         # HUD setup
         self._init_hud()
 
+        # Crew view setup
+        self._init_crew_view()
+
         # Preview frame counter
         self._preview_frame_count = 0
 
@@ -738,6 +741,117 @@ class LcdDisplay:
         self._hud_cache_key = cache_key
 
         return cache_key
+
+    # ─── Crew view ──────────────────────────────────────────────────────
+
+    def _init_crew_view(self):
+        """Pre-allocate resources for the People in Space view."""
+        self._crew_img = Image.new('RGB', (self.width, self.height), (0, 0, 0))
+        self._crew_cache_key: Optional[str] = None
+
+    def invalidate_crew_cache(self):
+        """Reset crew view cache so the next render_crew_view() redraws."""
+        self._crew_cache_key = None
+
+        # Pre-resolve fonts at sizes needed for crew view
+        self._crew_title_font = self._get_font(None, 15)
+        self._crew_subtitle_font = self._get_font(None, 11)
+        self._crew_count_font = self._get_font(None, 48)
+        self._crew_craft_font = self._get_font(None, 13)
+        self._crew_name_font = self._get_font(None, 11)
+
+    def render_crew_view(self, astros_data) -> bool:
+        """Render the People in Space view into _frame_buf and send to display.
+
+        Returns True if a frame was sent (data changed), False if cached.
+        """
+        key = f"{astros_data.count}|" + "|".join(
+            f"{c.name}:{c.craft}" for c in astros_data.crew
+        )
+        if key == self._crew_cache_key:
+            return False
+
+        img = self._crew_img
+        draw = ImageDraw.Draw(img)
+
+        # Clear to black
+        draw.rectangle([0, 0, self.width, self.height], fill=(0, 0, 0))
+
+        label_color = THEME.hud.label.color
+        value_color = THEME.hud.value.color
+
+        # Title
+        title = "PEOPLE IN SPACE"
+        bbox = draw.textbbox((0, 0), title, font=self._crew_title_font)
+        tw = bbox[2] - bbox[0]
+        draw.text(((self.width - tw) // 2, 30), title,
+                  fill=label_color, font=self._crew_title_font)
+
+        # Subtitle
+        subtitle = "RIGHT NOW"
+        bbox = draw.textbbox((0, 0), subtitle, font=self._crew_subtitle_font)
+        sw = bbox[2] - bbox[0]
+        draw.text(((self.width - sw) // 2, 52), subtitle,
+                  fill=label_color, font=self._crew_subtitle_font)
+
+        # Large count number
+        count_str = str(astros_data.count)
+        bbox = draw.textbbox((0, 0), count_str, font=self._crew_count_font)
+        cw = bbox[2] - bbox[0]
+        draw.text(((self.width - cw) // 2, 80), count_str,
+                  fill=value_color, font=self._crew_count_font)
+
+        # Separator line
+        margin = 20
+        sep_y = 145
+        draw.line([margin, sep_y, self.width - margin, sep_y],
+                  fill=label_color, width=1)
+
+        # Group crew by craft
+        crafts: dict[str, list[str]] = {}
+        for member in astros_data.crew:
+            crafts.setdefault(member.craft, []).append(member.name)
+
+        y = sep_y + 15
+        line_h = 16
+        indent = 24
+
+        for craft_name, members in crafts.items():
+            if y + line_h > self.height - 10:
+                draw.text((margin, y), "...",
+                          fill=value_color, font=self._crew_name_font)
+                break
+
+            # Craft header
+            draw.text((margin, y), craft_name.upper(),
+                      fill=label_color, font=self._crew_craft_font)
+            y += line_h + 2
+
+            for name in members:
+                if y + line_h > self.height - 10:
+                    draw.text((indent, y), "...",
+                              fill=value_color, font=self._crew_name_font)
+                    y += line_h
+                    break
+                draw.text((indent, y), name,
+                          fill=value_color, font=self._crew_name_font)
+                y += line_h
+
+            y += 8  # gap between craft groups
+
+        # Convert to RGB565 and write to frame buffer
+        rgb565_bytes = self._image_to_rgb565_bytes(img)
+        self._frame_buf[:] = rgb565_bytes
+
+        # Send to display
+        if self.driver:
+            self.driver.display_raw(self._frame_buf)
+        else:
+            self._preview_frame_count += 1
+            self._save_preview(self._frame_buf)
+
+        self._crew_cache_key = key
+        return True
 
     # ─── RGB565 conversion ────────────────────────────────────────────────
 

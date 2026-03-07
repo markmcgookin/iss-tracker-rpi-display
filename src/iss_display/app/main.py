@@ -16,6 +16,13 @@ import threading
 from iss_display.config import Settings
 from iss_display.display.lcd_driver import LcdDisplay
 from iss_display.data.iss_client import ISSClient, ISSFetchError, ISSFix
+from iss_display.data.astros_client import AstrosClient
+
+try:
+    import RPi.GPIO as GPIO
+    _HW_AVAILABLE = True
+except ImportError:
+    _HW_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +279,53 @@ class ISSOrbitInterpolator:
                 time.sleep(5.0)
 
 
+class ViewToggle:
+    """Polls a GPIO toggle switch to determine the active display view.
+
+    ON (LOW / closed to GND) = ISS tracker view
+    OFF (HIGH / open, pulled up) = Crew view
+
+    In preview mode (no GPIO), defaults to ISS view.
+    """
+
+    ISS_VIEW = 0
+    CREW_VIEW = 1
+
+    def __init__(self, gpio_pin: int, preview_mode: bool):
+        self._pin = gpio_pin
+        self._preview = preview_mode
+        self._current_view = self.ISS_VIEW
+        self._prev_view = self.ISS_VIEW
+
+        if not preview_mode and _HW_AVAILABLE:
+            # GPIO.setmode already called by ST7796S._init_gpio() before us
+            GPIO.setup(self._pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            logger.info("Toggle switch initialized on GPIO %d", self._pin)
+        else:
+            logger.info("Toggle switch: preview mode, defaulting to ISS view")
+
+    def poll(self) -> int:
+        """Read the current switch position. Call from main loop (~100ms)."""
+        self._prev_view = self._current_view
+
+        if self._preview or not _HW_AVAILABLE:
+            return self._current_view
+
+        try:
+            pin_state = GPIO.input(self._pin)
+            # LOW (0) = switch closed to GND = ISS view
+            # HIGH (1) = switch open, pulled up = Crew view
+            self._current_view = self.CREW_VIEW if pin_state else self.ISS_VIEW
+        except Exception as e:
+            logger.warning("Toggle switch read failed: %s", e)
+
+        return self._current_view
+
+    def view_changed(self) -> bool:
+        """True if the view changed on the last poll()."""
+        return self._current_view != self._prev_view
+
+
 class DisplayRenderer(threading.Thread):
     """Dedicated thread for smooth globe rotation rendering.
 
@@ -289,11 +343,30 @@ class DisplayRenderer(threading.Thread):
         self._telemetry: Optional[ISSFix] = None
         self.heartbeat: float = time.monotonic()
         self._consecutive_errors = 0
+        self._active_view: int = ViewToggle.ISS_VIEW
+        self._crew_data = None
+        self._crew_rendered = False
 
     def set_telemetry(self, telemetry: ISSFix):
         """Update the telemetry snapshot read by the render loop."""
         with self._lock:
             self._telemetry = telemetry
+
+    def set_view(self, view: int):
+        """Set the active view (called from main thread)."""
+        with self._lock:
+            if view != self._active_view:
+                self._active_view = view
+                self._crew_rendered = False
+                if view == ViewToggle.CREW_VIEW:
+                    self._lcd.invalidate_crew_cache()
+
+    def set_crew_data(self, data):
+        """Update the crew data snapshot for the crew view."""
+        with self._lock:
+            if data is not self._crew_data:
+                self._crew_data = data
+                self._crew_rendered = False
 
     def stop(self):
         self._running = False
@@ -303,61 +376,98 @@ class DisplayRenderer(threading.Thread):
         frame_period = lcd._rotation_period / lcd.num_frames
 
         while self._running:
-            # Wait for the next globe frame boundary using hybrid sleep:
-            # coarse time.sleep() for most of the wait, then busy-wait
-            # for the final ms to get sub-ms precision on the Pi 3.
-            now = time.time()
-            elapsed = now - lcd._rotation_start_time
-            time_in_frame = elapsed % frame_period
-            time_to_next = frame_period - time_in_frame
-
-            if time_to_next > 0.008:
-                time.sleep(time_to_next - 0.006)
-
-            target = now + time_to_next
-            while time.time() < target:
-                pass  # busy-wait for precise frame alignment
-
-            # Read latest telemetry (brief lock)
             with self._lock:
-                telemetry = self._telemetry
+                active_view = self._active_view
 
-            if telemetry is not None:
-                try:
-                    lcd.update_with_telemetry(telemetry)
-                    self._consecutive_errors = 0
-                except Exception as e:
-                    self._consecutive_errors += 1
-                    logger.error(f"Render error ({self._consecutive_errors}x): {e}")
-
-                    if self._consecutive_errors >= _EXIT_AFTER_ERRORS:
-                        logger.critical(
-                            f"{self._consecutive_errors} consecutive render errors, "
-                            f"exiting for systemd restart"
-                        )
-                        sys.exit(1)
-                    elif self._consecutive_errors >= _REINIT_AFTER_ERRORS:
-                        logger.warning(
-                            f"{self._consecutive_errors} consecutive errors, "
-                            f"attempting display re-init"
-                        )
-                        try:
-                            lcd.reinit()
-                        except Exception as reinit_err:
-                            logger.error(f"Display re-init failed: {reinit_err}")
+            if active_view == ViewToggle.ISS_VIEW:
+                self._run_iss_frame(lcd, frame_period)
+            else:
+                self._run_crew_frame(lcd)
 
             # Maintenance runs between frames where there is spare time.
             # Needs to be on the render thread for safe SPI/GPIO access.
             lcd.maybe_run_maintenance()
             self.heartbeat = time.monotonic()
 
+    def _run_iss_frame(self, lcd, frame_period):
+        """Render one ISS globe frame with precise timing."""
+        # Wait for the next globe frame boundary using hybrid sleep:
+        # coarse time.sleep() for most of the wait, then busy-wait
+        # for the final ms to get sub-ms precision on the Pi 3.
+        now = time.time()
+        elapsed = now - lcd._rotation_start_time
+        time_in_frame = elapsed % frame_period
+        time_to_next = frame_period - time_in_frame
+
+        if time_to_next > 0.008:
+            time.sleep(time_to_next - 0.006)
+
+        target = now + time_to_next
+        while time.time() < target:
+            pass  # busy-wait for precise frame alignment
+
+        # Read latest telemetry (brief lock)
+        with self._lock:
+            telemetry = self._telemetry
+
+        if telemetry is not None:
+            try:
+                lcd.update_with_telemetry(telemetry)
+                self._consecutive_errors = 0
+            except Exception as e:
+                self._consecutive_errors += 1
+                logger.error(f"Render error ({self._consecutive_errors}x): {e}")
+                self._handle_render_error(lcd)
+
+    def _run_crew_frame(self, lcd):
+        """Render the crew view (static, re-render only on data change)."""
+        with self._lock:
+            crew_data = self._crew_data
+            crew_rendered = self._crew_rendered
+
+        if not crew_rendered and crew_data is not None:
+            try:
+                lcd.render_crew_view(crew_data)
+                with self._lock:
+                    self._crew_rendered = True
+                self._consecutive_errors = 0
+            except Exception as e:
+                self._consecutive_errors += 1
+                logger.error(f"Crew render error ({self._consecutive_errors}x): {e}")
+                self._handle_render_error(lcd)
+
+        # No animation — sleep, wake to check for view/data change
+        time.sleep(0.1)
+
+    def _handle_render_error(self, lcd):
+        """Handle consecutive render errors with escalating recovery."""
+        if self._consecutive_errors >= _EXIT_AFTER_ERRORS:
+            logger.critical(
+                f"{self._consecutive_errors} consecutive render errors, "
+                f"exiting for systemd restart"
+            )
+            sys.exit(1)
+        elif self._consecutive_errors >= _REINIT_AFTER_ERRORS:
+            logger.warning(
+                f"{self._consecutive_errors} consecutive errors, "
+                f"attempting display re-init"
+            )
+            try:
+                lcd.reinit()
+            except Exception as reinit_err:
+                logger.error(f"Display re-init failed: {reinit_err}")
+
 
 def run_loop(settings: Settings) -> None:
     iss_client = ISSClient(settings)
+    astros_client = AstrosClient()
     driver = LcdDisplay(settings)
 
     interpolator = ISSOrbitInterpolator(iss_client, api_interval=30.0)
     interpolator.start()
+
+    # Pre-fetch crew data before entering main loop
+    astros_client.get_astros(force=True)
 
     logger.info("Starting ISS Tracker Display Loop...")
 
@@ -365,6 +475,10 @@ def run_loop(settings: Settings) -> None:
     last_thread_check = time.monotonic()
 
     renderer = DisplayRenderer(driver)
+
+    # Toggle switch: GPIO input, or preview mode fallback
+    preview_mode = settings.preview_only or not _HW_AVAILABLE
+    toggle = ViewToggle(settings.gpio_toggle, preview_mode)
 
     def signal_handler(sig, frame):
         nonlocal running
@@ -392,9 +506,25 @@ def run_loop(settings: Settings) -> None:
         while running:
             _sd_notify("WATCHDOG=1")
 
-            # Feed latest telemetry to the render thread
+            # Poll toggle switch
+            current_view = toggle.poll()
+
+            if toggle.view_changed():
+                view_name = "ISS" if current_view == ViewToggle.ISS_VIEW else "CREW"
+                logger.info("View switched to %s", view_name)
+                renderer.set_view(current_view)
+                if current_view == ViewToggle.ISS_VIEW:
+                    # Force full frame to resync display with globe buffer
+                    driver.force_full_frame()
+
+            # Always keep ISS telemetry flowing (even in crew view)
             telemetry = interpolator.get_telemetry()
             renderer.set_telemetry(telemetry)
+
+            # Feed crew data to renderer (client handles its own refresh timer)
+            if current_view == ViewToggle.CREW_VIEW:
+                crew_data = astros_client.get_astros()
+                renderer.set_crew_data(crew_data)
 
             now_mono = time.monotonic()
 
@@ -451,6 +581,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             gpio_dc=settings.gpio_dc,
             gpio_rst=settings.gpio_rst,
             gpio_bl=settings.gpio_bl,
+            gpio_toggle=settings.gpio_toggle,
             spi_bus=settings.spi_bus,
             spi_device=settings.spi_device,
             spi_speed_hz=settings.spi_speed_hz,
