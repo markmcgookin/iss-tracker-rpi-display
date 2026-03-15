@@ -303,7 +303,8 @@ class ViewToggle:
         self._prev_view = self.ISS_VIEW
 
         if not preview_mode and _HW_AVAILABLE:
-            # GPIO.setmode already called by ST7796S._init_gpio() before us
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
             GPIO.setup(self._pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
             logger.info("Toggle switch initialized on GPIO %d", self._pin)
         else:
@@ -334,10 +335,10 @@ class ViewToggle:
 class DisplayRenderer(threading.Thread):
     """Dedicated thread for smooth globe rotation rendering.
 
-    Isolates all display I/O (SPI writes, GPIO) from the main thread so that
-    housekeeping work (GC, watchdog, telemetry fetching) cannot delay frame
-    delivery.  Uses globe-frame-aligned sleep to wake up within ~2 ms of each
-    frame transition rather than a fixed-interval poll.
+    Isolates all display I/O from the main thread so that housekeeping work
+    (GC, watchdog, telemetry fetching) cannot delay frame delivery.
+    Uses globe-frame-aligned sleep to wake up within ~2 ms of each frame
+    transition rather than a fixed-interval poll.
     """
 
     def __init__(self, lcd_display: LcdDisplay):
@@ -389,8 +390,6 @@ class DisplayRenderer(threading.Thread):
             else:
                 self._run_crew_frame(lcd)
 
-            # Maintenance runs between frames where there is spare time.
-            # Needs to be on the render thread for safe SPI/GPIO access.
             lcd.maybe_run_maintenance()
             self.heartbeat = time.monotonic()
 
@@ -591,7 +590,6 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     # Override preview_only from CLI if set
     if args.preview_only and not settings.preview_only:
-        # Reconstruct settings with preview_only=True
         settings = Settings(
             iss_api_url=settings.iss_api_url,
             n2yo_api_key=settings.n2yo_api_key,
@@ -600,13 +598,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             preview_dir=settings.preview_dir,
             preview_only=True,
             log_level=settings.log_level,
-            gpio_dc=settings.gpio_dc,
-            gpio_rst=settings.gpio_rst,
-            gpio_bl=settings.gpio_bl,
+            fb_device=settings.fb_device,
             gpio_toggle=settings.gpio_toggle,
-            spi_bus=settings.spi_bus,
-            spi_device=settings.spi_device,
-            spi_speed_hz=settings.spi_speed_hz,
         )
 
     configure_logging(settings.log_level)

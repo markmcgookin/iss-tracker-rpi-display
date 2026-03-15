@@ -1,5 +1,9 @@
+import fcntl
 import logging
 import math
+import mmap
+import os
+import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,39 +15,13 @@ import numpy as np
 if TYPE_CHECKING:
     from iss_display.data.iss_client import ISSFix
 
-try:
-    import spidev
-    import RPi.GPIO as GPIO
-    HARDWARE_AVAILABLE = True
-except ImportError:
-    HARDWARE_AVAILABLE = False
+HARDWARE_AVAILABLE = os.path.exists('/dev/fb0')
 
 from iss_display.config import Settings
 from iss_display.data.geography import get_common_area_name
 from iss_display.theme import THEME, rgb_to_hex, resolve_text_style, resolve_border_color
 
 logger = logging.getLogger(__name__)
-
-# ST7796S Command Constants
-SWRESET = 0x01
-SLPIN   = 0x10
-SLPOUT  = 0x11
-NORON   = 0x13
-INVON   = 0x21
-DISPOFF = 0x28
-DISPON  = 0x29
-CASET   = 0x2A
-RASET   = 0x2B
-RAMWR   = 0x2C
-MADCTL  = 0x36
-COLMOD  = 0x3A
-RDDST   = 0x09
-
-# Recovery constants
-_MAX_RECOVERY_ATTEMPTS = 3
-_LIGHT_REINIT_INTERVAL_SEC = 15 * 60    # 15 minutes
-_FULL_REINIT_INTERVAL_SEC = 60 * 60     # 60 minutes
-_HEALTH_CHECK_INTERVAL_SEC = 60         # 1 minute
 
 RGB = Tuple[int, int, int]
 
@@ -71,369 +49,76 @@ def _rgb_to_rgb565(r: int, g: int, b: int) -> int:
     return val
 
 
-class ST7796S:
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        self.width = settings.display_width
-        self.height = settings.display_height
+class FramebufferDisplay:
+    """Writes frames to the Linux framebuffer device (e.g. /dev/fb0).
 
-        self.dc = settings.gpio_dc
-        self.rst = settings.gpio_rst
-        self.bl = settings.gpio_bl
+    Accepts internal RGB565 big-endian frames and converts them to the pixel
+    format reported by the framebuffer driver (16-bit or 32-bit BGRA).
+    """
 
-        self._consecutive_failures = 0
-        self._last_light_reinit = time.monotonic()
-        self._last_full_reinit = time.monotonic()
-        self._last_health_check = time.monotonic()
-        self._health_check_supported = True  # disabled if readback returns all zeros
-        self._health_check_zero_count = 0
+    _FBIOGET_VSCREENINFO = 0x4600
+    _FBIOGET_FSCREENINFO = 0x4602
 
-        # Pre-allocated single-byte buffers: avoid per-call list allocation in command()/data()
-        self._cmd_buf = bytearray(1)
-        self._dat_buf = bytearray(1)
-        # Pre-allocated 4-byte buffers for CASET/RASET window commands
-        self._caset_data = bytearray(4)
-        self._raset_data = bytearray(4)
+    def __init__(self, fb_device: str = '/dev/fb0'):
+        self._fb = open(fb_device, 'rb+')
 
-        # Set to True by _recover() so LcdDisplay.maybe_run_maintenance() can force a full frame
-        self.reinit_occurred = False
+        # Variable screen info: xres(4), yres(4), xres_virtual(4), yres_virtual(4),
+        # xoffset(4), yoffset(4), bits_per_pixel(4), ...
+        vinfo = bytearray(160)
+        fcntl.ioctl(self._fb, self._FBIOGET_VSCREENINFO, vinfo)
+        self.width = struct.unpack_from('I', vinfo, 0)[0]
+        self.height = struct.unpack_from('I', vinfo, 4)[0]
+        self.bits_per_pixel = struct.unpack_from('I', vinfo, 24)[0]
 
-        self._init_gpio()
-        self._init_spi()
-        self._init_display(first_boot=True)
+        # Fixed screen info: line_length at offset 16
+        finfo = bytearray(68)
+        fcntl.ioctl(self._fb, self._FBIOGET_FSCREENINFO, finfo)
+        self.line_length = struct.unpack_from('I', finfo, 16)[0]
 
-    def _init_gpio(self):
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        GPIO.setup(self.dc, GPIO.OUT)
-        GPIO.setup(self.rst, GPIO.OUT)
-        GPIO.setup(self.bl, GPIO.OUT)
-        GPIO.output(self.bl, GPIO.LOW)
+        fb_size = self.line_length * self.height
+        self._mm = mmap.mmap(self._fb.fileno(), fb_size)
 
-    def _init_spi(self):
-        self.spi = spidev.SpiDev()
-        self.spi.open(self.settings.spi_bus, self.settings.spi_device)
-        self.spi.max_speed_hz = self.settings.spi_speed_hz
-        self.spi.mode = 0b00
-        logger.info(f"SPI initialized: bus={self.settings.spi_bus}, "
-                     f"device={self.settings.spi_device}, "
-                     f"speed={self.settings.spi_speed_hz / 1_000_000:.1f} MHz")
+        logger.info(
+            "Framebuffer opened: %s %dx%d %dbpp line_length=%d",
+            fb_device, self.width, self.height, self.bits_per_pixel, self.line_length,
+        )
 
-    def _reset(self):
-        GPIO.output(self.rst, GPIO.HIGH)
-        time.sleep(0.02)
-        GPIO.output(self.rst, GPIO.LOW)
-        time.sleep(0.02)
-        GPIO.output(self.rst, GPIO.HIGH)
-        time.sleep(0.20)
-
-    def command(self, cmd: int):
-        GPIO.output(self.dc, GPIO.LOW)
-        self._cmd_buf[0] = cmd
-        self.spi.writebytes2(self._cmd_buf)
-
-    def data(self, val: int):
-        GPIO.output(self.dc, GPIO.HIGH)
-        self._dat_buf[0] = val
-        self.spi.writebytes2(self._dat_buf)
-
-    def _init_display(self, *, first_boot: bool = False):
-        logger.info("Display init: hardware reset")
-        self._reset()
-
-        self.command(SWRESET)
-        time.sleep(0.15)
-
-        self.command(SLPOUT)
-        time.sleep(0.15)
-        logger.info("Display init: SWRESET + SLPOUT done")
-
-        self.command(COLMOD)
-        self.data(0x55)  # 16-bit/pixel
-
-        # Memory Access Control: MX=1, BGR=1
-        self.command(MADCTL)
-        self.data(0x48)
-
-        self.command(INVON)
-
-        self.command(NORON)
-        time.sleep(0.01)
-
-        self.command(DISPON)
-        time.sleep(0.12)
-        logger.info("Display init: DISPON done")
-
-        self.set_window(0, 0, self.width - 1, self.height - 1)
-
-        if first_boot:
-            GPIO.output(self.bl, GPIO.HIGH)
-            # Diagnostic: red fill to verify display hardware is responding
-            logger.info("Display init: filling RED test pattern")
-            self._fill(0xF800)  # RGB565 red
-            time.sleep(1.0)
-            logger.info("Display init: filling BLACK")
-            self._fill(0x0000)
-
-        now = time.monotonic()
-        self._last_light_reinit = now
-        self._last_full_reinit = now
-        self._last_health_check = now
-        self._consecutive_failures = 0
-        logger.info("Display initialized")
-
-    def _light_reinit(self):
-        """Reaffirm critical controller registers without sleep/wake transitions.
-
-        Re-sends all stateless register-write commands (including extended
-        panel config) that correct potential drift without triggering display
-        blanking.  SLPOUT, NORON, and DISPON are intentionally omitted — they
-        are no-ops on an already-awake display but can cause brief visual
-        artifacts on some ST7796S modules.
-        """
+    def display_raw(self, rgb565_bytes: Union[bytes, bytearray]):
+        """Write a full frame of big-endian RGB565 data to the framebuffer."""
         try:
-            self.command(COLMOD)
-            self.data(0x55)
-            self.command(MADCTL)
-            self.data(0x48)
-            self.command(INVON)
-            self.set_window(0, 0, self.width - 1, self.height - 1)
-            self._last_light_reinit = time.monotonic()
-            logger.info("Display light re-init complete")
+            if self.bits_per_pixel == 32:
+                # Convert big-endian RGB565 → 32-bit BGRA (common on Pi OS Bookworm/KMS)
+                arr = np.frombuffer(rgb565_bytes, dtype='>u2')
+                r = ((arr >> 11) & 0x1F).astype(np.uint8) << 3
+                g = ((arr >> 5)  & 0x3F).astype(np.uint8) << 2
+                b = (arr         & 0x1F).astype(np.uint8) << 3
+                a = np.full_like(r, 255)
+                raw = np.stack([b, g, r, a], axis=-1).tobytes()
+            else:
+                # 16-bit: swap bytes from big-endian to native little-endian (ARM)
+                arr = np.frombuffer(rgb565_bytes, dtype='>u2')
+                raw = arr.byteswap().tobytes()
+            self._mm.seek(0)
+            self._mm.write(raw)
         except Exception as e:
-            logger.warning(f"Light re-init failed: {e}")
-            self._recover()
-
-    def _full_reinit(self):
-        """Full re-init with hardware reset — recovers from any controller state."""
-        try:
-            self._init_display()
-            self._last_full_reinit = time.monotonic()
-            logger.info("Display full re-init complete")
-        except Exception as e:
-            logger.error(f"Full re-init failed: {e}")
-            self._recover()
-
-    def _check_health(self) -> bool:
-        """Read display status register to verify controller state.
-
-        Returns True if healthy, False if re-init is needed.
-        Some LCD modules don't support SPI readback (MISO not functional or
-        protocol incompatible). If we get all-zero responses 3 times in a row,
-        we disable readback and rely solely on periodic re-init.
-        """
-        if not self._health_check_supported:
-            self._last_health_check = time.monotonic()
-            return True
-
-        try:
-            self.command(RDDST)
-            GPIO.output(self.dc, GPIO.HIGH)
-            # Read 5 bytes: 1 dummy + 4 status bytes
-            status = self.spi.xfer2([0x00] * 5)
-            self._last_health_check = time.monotonic()
-
-            # Detect non-functional readback: all zeros means the module
-            # doesn't support SPI reads (common on many cheap SPI LCD boards)
-            if all(b == 0 for b in status):
-                self._health_check_zero_count += 1
-                if self._health_check_zero_count >= 3:
-                    logger.debug("Display status readback returns all zeros — "
-                                 "disabling RDDST health checks, relying on periodic re-init")
-                    self._health_check_supported = False
-                return True  # assume healthy since display was working
-
-            # Got real data — reset zero counter
-            self._health_check_zero_count = 0
-
-            # Status byte 1 (index 1): bit 2 = display on, bit 4 = normal mode
-            st1 = status[1]
-            display_on = bool(st1 & 0x04)
-            normal_mode = bool(st1 & 0x10)
-
-            if not display_on or not normal_mode:
-                logger.warning(f"Display health check failed: status={[hex(b) for b in status]}, "
-                               f"display_on={display_on}, normal_mode={normal_mode}")
-                return False
-
-            logger.debug(f"Display health OK: status={[hex(b) for b in status]}")
-            return True
-        except Exception as e:
-            logger.warning(f"Display health check read failed: {e}")
-            return False
-
-    def _periodic_maintenance(self) -> bool:
-        """Run periodic health checks and re-initialization.
-
-        Returns True if a re-init occurred (caller should force a full frame).
-        """
-        now = time.monotonic()
-
-        # Health check every 60 seconds
-        if now - self._last_health_check >= _HEALTH_CHECK_INTERVAL_SEC:
-            if not self._check_health():
-                logger.warning("Health check triggered re-init")
-                self._full_reinit()
-                return True
-
-        # Full re-init every 60 minutes
-        if now - self._last_full_reinit >= _FULL_REINIT_INTERVAL_SEC:
-            self._full_reinit()
-            return True
-
-        # Light re-init every 15 minutes
-        if now - self._last_light_reinit >= _LIGHT_REINIT_INTERVAL_SEC:
-            self._light_reinit()
-            return True
-
-        return False
-
-    def _recover(self):
-        """Attempt to recover SPI bus and display from a failed state."""
-        logger.warning(f"Attempting SPI/display recovery (failures: {self._consecutive_failures})...")
-        try:
-            self.spi.close()
-        except Exception:
-            pass
-
-        time.sleep(0.1)
-
-        try:
-            self._init_spi()
-            if self._consecutive_failures >= _MAX_RECOVERY_ATTEMPTS:
-                logger.warning("Multiple failures, performing hardware reset")
-                self._reset()
-                time.sleep(0.2)
-            self._init_display()
-            self.reinit_occurred = True  # signal LcdDisplay to force a full frame
-            logger.info("SPI/display recovery successful")
-        except Exception as e:
-            logger.error(f"Recovery failed: {e}")
-
-    def _fill(self, color: int):
-        """Fill the entire screen with a solid color (RGB565)."""
-        self.set_window(0, 0, self.width - 1, self.height - 1)
-        high = (color >> 8) & 0xFF
-        low = color & 0xFF
-        pixel_data = bytes([high, low] * (self.width * self.height))
-        logger.info(f"_fill: color=0x{color:04X}, {len(pixel_data)} bytes, "
-                    f"DC pin will be set HIGH")
-        GPIO.output(self.dc, GPIO.HIGH)
-        self.spi.writebytes2(pixel_data)
-        logger.info("_fill: SPI write complete")
-
-    def set_window(self, x0, y0, x1, y1):
-        # CASET — send command then 4 data bytes in one burst
-        self._cmd_buf[0] = CASET
-        GPIO.output(self.dc, GPIO.LOW)
-        self.spi.writebytes2(self._cmd_buf)
-        GPIO.output(self.dc, GPIO.HIGH)
-        d = self._caset_data
-        d[0] = x0 >> 8; d[1] = x0 & 0xFF; d[2] = x1 >> 8; d[3] = x1 & 0xFF
-        self.spi.writebytes2(d)
-
-        # RASET
-        self._cmd_buf[0] = RASET
-        GPIO.output(self.dc, GPIO.LOW)
-        self.spi.writebytes2(self._cmd_buf)
-        GPIO.output(self.dc, GPIO.HIGH)
-        d = self._raset_data
-        d[0] = y0 >> 8; d[1] = y0 & 0xFF; d[2] = y1 >> 8; d[3] = y1 & 0xFF
-        self.spi.writebytes2(d)
-
-        # RAMWR
-        self._cmd_buf[0] = RAMWR
-        GPIO.output(self.dc, GPIO.LOW)
-        self.spi.writebytes2(self._cmd_buf)
-
-    def display_raw(self, pixel_bytes: Union[bytes, bytearray]):
-        """Display pre-converted RGB565 data directly, with error recovery."""
-        try:
-            self.set_window(0, 0, self.width - 1, self.height - 1)
-            GPIO.output(self.dc, GPIO.HIGH)
-            self.spi.writebytes2(pixel_bytes)
-            self._consecutive_failures = 0
-        except Exception as e:
-            self._consecutive_failures += 1
-            logger.error(f"SPI write failed ({self._consecutive_failures}x): {e}")
-            self._recover()
-
-    def display_region(self, x0: int, y0: int, x1: int, y1: int, frame_buf_np: "np.ndarray"):
-        """Send a rectangular sub-region from frame_buf_np to the display.
-
-        Used for partial updates (ISS marker erase/redraw) to avoid sending
-        the full 307 KB frame when only a small area changed.
-        """
-        region_bytes = np.ascontiguousarray(frame_buf_np[y0:y1 + 1, x0:x1 + 1]).tobytes()
-        try:
-            self.set_window(x0, y0, x1, y1)
-            GPIO.output(self.dc, GPIO.HIGH)
-            self.spi.writebytes2(region_bytes)
-            self._consecutive_failures = 0
-        except Exception as e:
-            self._consecutive_failures += 1
-            logger.error(f"SPI region write failed ({self._consecutive_failures}x): {e}")
-            self._recover()
-
-    def maybe_run_maintenance(self) -> bool:
-        """Run periodic maintenance if any interval has elapsed.
-
-        Call this between frames from the main loop, NOT during frame writes.
-        Returns True if a re-init occurred.
-        """
-        return self._periodic_maintenance()
+            logger.error("Framebuffer write failed: %s", e)
 
     def close(self):
-        """Properly shut down the display with robust error handling."""
-        # Backlight off first — immediate visual feedback
+        """Clear screen and release framebuffer resources."""
         try:
-            GPIO.output(self.bl, GPIO.LOW)
+            self._mm.seek(0)
+            self._mm.write(bytes(self.line_length * self.height))
         except Exception:
             pass
-
-        # Clear screen (single fill, IPS panels don't ghost)
         try:
-            black_screen = bytes(self.width * self.height * 2)
-            self.set_window(0, 0, self.width - 1, self.height - 1)
-            GPIO.output(self.dc, GPIO.HIGH)
-            self.spi.writebytes2(black_screen)
-            time.sleep(0.05)
-        except Exception as e:
-            logger.debug(f"Screen clear during shutdown failed: {e}")
-
-        # Display off command
-        try:
-            self.command(DISPOFF)
-            time.sleep(0.05)
+            self._mm.close()
         except Exception:
             pass
-
-        # Sleep mode
         try:
-            self.command(SLPIN)
-            time.sleep(0.12)
+            self._fb.close()
         except Exception:
             pass
-
-        # Hardware reset — guarantees known state for next startup
-        try:
-            GPIO.output(self.rst, GPIO.LOW)
-            time.sleep(0.05)
-        except Exception:
-            pass
-
-        # Release hardware resources
-        try:
-            self.spi.close()
-        except Exception:
-            pass
-
-        try:
-            GPIO.cleanup()
-        except Exception:
-            pass
-
-        logger.info("Display shut down cleanly")
+        logger.info("Framebuffer closed")
 
 
 class LcdDisplay:
@@ -441,19 +126,18 @@ class LcdDisplay:
         self.settings = settings
         self.width = settings.display_width
         self.height = settings.display_height
-        self._bytes_per_row = self.width * 2  # 2 bytes per pixel (RGB565)
 
-        self.driver: Optional[ST7796S] = None
+        self.driver: Optional[FramebufferDisplay] = None
         if not settings.preview_only and HARDWARE_AVAILABLE:
             try:
-                self.driver = ST7796S(settings)
-                logger.info("Hardware display initialized")
+                self.driver = FramebufferDisplay(settings.fb_device)
+                logger.info("Framebuffer display initialized")
             except Exception as e:
-                logger.error(f"Failed to initialize hardware display: {e}")
+                logger.error(f"Failed to initialize framebuffer display: {e}")
                 self.driver = None
         else:
             if not HARDWARE_AVAILABLE:
-                logger.warning("Hardware libraries not found. Running in preview mode.")
+                logger.warning("Framebuffer device not found (/dev/fb0). Running in preview mode.")
             else:
                 logger.info("Running in preview-only mode")
 
@@ -488,11 +172,6 @@ class LcdDisplay:
         # Writes to _frame_buf_np go directly to _frame_buf used by display_raw().
         self._frame_buf_np = np.frombuffer(self._frame_buf, dtype='>u2').reshape(self.height, self.width)
 
-        # Partial-update state
-        self._prev_frame_idx: Optional[int] = None
-        self._prev_marker_bbox: Optional[Tuple[int, int, int, int]] = None  # (x0, y0, x1, y1)
-        self._force_full_frame: bool = True  # first frame is always a full write
-
         # Pre-allocated marker drawing buffers (avoids per-frame numpy allocations)
         m = THEME.marker
         max_marker_r = int(m.outer_ring_radius * m.max_size_scale) + 1
@@ -515,39 +194,16 @@ class LcdDisplay:
         self._preview_frame_count = 0
 
     def reinit(self):
-        """Re-initialize the display hardware (called by main loop on persistent errors)."""
-        if self.driver:
-            self.driver._full_reinit()
+        """Force a full frame redraw (no hardware reinit needed for framebuffer)."""
         self.force_full_frame()
 
     def maybe_run_maintenance(self):
-        """Run periodic display maintenance if due (call between frames).
-
-        Forces a full frame on the next update if a re-init occurred, so the
-        display state is guaranteed to be in sync with _frame_buf.
-        """
-        if self.driver:
-            if self.driver.maybe_run_maintenance():
-                self.force_full_frame()
-            # Also pick up reinit_occurred set by _recover() during SPI error handling
-            if self.driver.reinit_occurred:
-                self.driver.reinit_occurred = False
-                self.force_full_frame()
-
-    def display_region(self, x0: int, y0: int, x1: int, y1: int):
-        """Send a rectangular region from _frame_buf_np to the display."""
-        if self.driver:
-            self.driver.display_region(x0, y0, x1, y1, self._frame_buf_np)
+        """No-op for framebuffer display — no hardware maintenance needed."""
+        pass
 
     def force_full_frame(self):
-        """Reset partial-update state so the next frame is a full rewrite.
-
-        Call after any display recovery or re-init to guarantee the display
-        and _frame_buf are back in sync.
-        """
-        self._force_full_frame = True
-        self._prev_frame_idx = None
-        self._prev_marker_bbox = None
+        """No-op: framebuffer driver always writes full frames."""
+        pass
 
     # ─── HUD ──────────────────────────────────────────────────────────────
 
@@ -1256,19 +912,7 @@ class LcdDisplay:
     # ─── Main update loop entry point ─────────────────────────────────────
 
     def update_with_telemetry(self, telemetry: "ISSFix"):
-        """Update the display with current ISS telemetry.
-
-        Uses a two-path strategy to minimise SPI bandwidth:
-
-        Full update (globe changed, HUD changed, or forced):
-          Copy globe frame → draw marker → patch HUD → send full 307 KB frame.
-
-        Partial update (globe and HUD unchanged):
-          Erase previous marker region from globe cache → draw new marker →
-          send only the two tiny marker bounding-box regions (~1 KB total).
-          This is how the Waveshare driver achieves high effective frame rates
-          at the 48 MHz SPI limit.
-        """
+        """Update the display with current ISS telemetry."""
         if not self.frames_generated:
             logger.warning("Frames not yet generated")
             return
@@ -1279,21 +923,11 @@ class LcdDisplay:
         current_frame = int(rotation_progress * self.num_frames) % self.num_frames
         central_lon = (current_frame * (360.0 / self.num_frames)) - 180.0
 
-        # Render HUD bars if telemetry changed (returns cache key, cheap when unchanged)
-        old_hud_key = self._hud_cache_key
-        new_hud_key = self._render_hud_bars(telemetry)
-        hud_changed = new_hud_key != old_hud_key
+        # Render HUD bars (cheap no-op when telemetry unchanged)
+        self._render_hud_bars(telemetry)
 
-        globe_changed = current_frame != self._prev_frame_idx
         iss_pos = self._calc_iss_screen_pos(telemetry.latitude, telemetry.longitude, central_lon)
-
-        if self._force_full_frame or globe_changed or hud_changed:
-            self._do_full_update(current_frame, iss_pos)
-            self._force_full_frame = False
-        else:
-            self._do_partial_update(current_frame, iss_pos)
-
-        self._prev_frame_idx = current_frame
+        self._do_full_update(current_frame, iss_pos)
 
         # Preview mode: save occasional PNGs
         if self.driver is None:
@@ -1302,49 +936,17 @@ class LcdDisplay:
                 self._save_preview(self._frame_buf)
 
     def _do_full_update(self, frame_idx: int, iss_pos):
-        """Full-frame update: copy globe, draw marker, patch HUD, send everything."""
+        """Full-frame update: copy globe, draw marker, patch HUD, send to display."""
         np.copyto(self._frame_buf_np, self.frame_np_cache[frame_idx])
 
-        new_bbox = None
         if iss_pos is not None:
             px, py, opacity = iss_pos
-            new_bbox = self._draw_iss_marker_rgb565(px, py, opacity)
+            self._draw_iss_marker_rgb565(px, py, opacity)
 
         self._patch_hud_bytes(self._frame_buf)
 
         if self.driver:
             self.driver.display_raw(self._frame_buf)
-
-        self._prev_marker_bbox = new_bbox
-
-    def _do_partial_update(self, frame_idx: int, iss_pos):
-        """Partial update: erase old marker, draw new, send union bbox once.
-
-        Uses a single SPI transfer covering both old and new marker regions
-        to prevent flicker from the display briefly showing bare globe.
-        """
-        old_bbox = self._prev_marker_bbox
-
-        # Erase old marker by restoring globe pixels (buffer only, no SPI)
-        if old_bbox is not None:
-            x0, y0, x1, y1 = old_bbox
-            self._frame_buf_np[y0:y1 + 1, x0:x1 + 1] = self.frame_np_cache[frame_idx][y0:y1 + 1, x0:x1 + 1]
-
-        # Draw new marker into buffer
-        new_bbox = None
-        if iss_pos is not None:
-            px, py, opacity = iss_pos
-            new_bbox = self._draw_iss_marker_rgb565(px, py, opacity)
-
-        # Send the union of old and new bounding boxes in one SPI transfer
-        union = old_bbox if new_bbox is None else new_bbox if old_bbox is None else (
-            min(old_bbox[0], new_bbox[0]), min(old_bbox[1], new_bbox[1]),
-            max(old_bbox[2], new_bbox[2]), max(old_bbox[3], new_bbox[3]),
-        )
-        if union is not None:
-            self.display_region(*union)
-
-        self._prev_marker_bbox = new_bbox
 
     def _save_preview(self, pixel_bytes: Union[bytes, bytearray]):
         """Save an RGB565 frame buffer as a PNG preview image."""

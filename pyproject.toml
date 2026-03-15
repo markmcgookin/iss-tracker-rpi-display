@@ -1,7 +1,7 @@
 [project]
 name = "iss-display"
 version = "0.1.0"
-description = "Self-contained ISS tracker with 3D globe on 3.5 inch TFT LCD"
+description = "Self-contained ISS tracker with 3D globe on official Raspberry Pi display"
 authors = [{name = "ISS Display Maintainers"}]
 requires-python = ">=3.11"
 dependencies = [
@@ -11,7 +11,6 @@ dependencies = [
     "cartopy>=0.22.0",
     "matplotlib>=3.8.0",
     "numpy>=1.26.0",
-    "spidev>=3.6",
     "rpi-lgpio>=0.6"
 ]
 

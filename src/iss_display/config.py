@@ -31,13 +31,8 @@ class Settings:
     preview_dir: Path
     preview_only: bool
     log_level: str
-    gpio_dc: int
-    gpio_rst: int
-    gpio_bl: int
+    fb_device: str
     gpio_toggle: int
-    spi_bus: int
-    spi_device: int
-    spi_speed_hz: int
 
     @classmethod
     def load(cls) -> "Settings":
@@ -47,16 +42,11 @@ class Settings:
         return cls(
             iss_api_url=os.getenv("ISS_API_URL", "https://api.wheretheiss.at/v1/satellites/25544"),
             n2yo_api_key=os.getenv("N2YO_API_KEY", ""),
-            display_width=int(os.getenv("DISPLAY_WIDTH", "320")),
+            display_width=int(os.getenv("DISPLAY_WIDTH", "800")),
             display_height=int(os.getenv("DISPLAY_HEIGHT", "480")),
             preview_dir=preview_dir,
             preview_only=_as_bool(os.getenv("PREVIEW_ONLY", "false"), default=False),
             log_level=os.getenv("ISS_LOG_LEVEL", "INFO"),
-            gpio_dc=int(os.getenv("GPIO_DC", "22")),
-            gpio_rst=int(os.getenv("GPIO_RST", "27")),
-            gpio_bl=int(os.getenv("GPIO_BL", "18")),
+            fb_device=os.getenv("FB_DEVICE", "/dev/fb0"),
             gpio_toggle=int(os.getenv("GPIO_TOGGLE", "17")),
-            spi_bus=int(os.getenv("SPI_BUS", "0")),
-            spi_device=int(os.getenv("SPI_DEVICE", "0")),
-            spi_speed_hz=int(os.getenv("SPI_SPEED_HZ", "48000000")),
         )
