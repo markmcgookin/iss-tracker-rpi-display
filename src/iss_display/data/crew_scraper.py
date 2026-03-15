@@ -1,7 +1,9 @@
-"""Custom web scraper for current ISS crew data.
+"""Crew data client for isslivenow.com.
+
+Calls the isslivenow.com backend API directly, spoofing the Origin header
+to pass its CORS check. Refreshes once per hour.
 
 Drop-in replacement for AstrosClient when CREW_SOURCE=scraper.
-Implement _scrape() to parse the target page and return a list of CrewMember.
 """
 
 from __future__ import annotations
@@ -16,23 +18,26 @@ from iss_display.data.astros_client import AstrosData, CrewMember
 
 logger = logging.getLogger(__name__)
 
-_SCRAPE_URL = ""  # TODO: set the target URL here
+_API_URL = "https://us-central1-iss-hd-live-android.cloudfunctions.net/getAstronautsData"
+_HEADERS = {
+    "Origin": "https://isslivenow.com",
+    "Referer": "https://isslivenow.com/",
+}
 _TIMEOUT = (3.05, 10)
 _REFRESH_INTERVAL = 3600.0  # 1 hour
 
 
 class CrewScraper:
-    """Scrapes current ISS crew from a web page.
+    """Fetches current ISS crew from the isslivenow.com backend API.
 
     Caches results and refreshes every hour. Never raises —
     returns stale cache on failure, or None if no data has ever
     been fetched successfully.
-
-    To implement: fill in _SCRAPE_URL and complete _scrape().
     """
 
     def __init__(self):
         self._session = requests.Session()
+        self._session.headers.update(_HEADERS)
         self._cached: Optional[AstrosData] = None
         self._last_fetch: float = 0.0
         self._consecutive_failures: int = 0
@@ -44,13 +49,14 @@ class CrewScraper:
             return self._cached
 
         try:
-            if not _SCRAPE_URL:
-                raise NotImplementedError("_SCRAPE_URL is not set in crew_scraper.py")
-
-            resp = self._session.get(_SCRAPE_URL, timeout=_TIMEOUT)
+            resp = self._session.get(_API_URL, timeout=_TIMEOUT)
             resp.raise_for_status()
-            crew = self._scrape(resp.text)
+            data = resp.json()
 
+            if not data.get("success", False):
+                raise ValueError(f"API returned failure: {data}")
+
+            crew = self._parse(data)
             self._cached = AstrosData(
                 count=len(crew),
                 crew=crew,
@@ -58,32 +64,34 @@ class CrewScraper:
             )
             self._last_fetch = now
             self._consecutive_failures = 0
-            logger.debug("Scraped crew: %d people", self._cached.count)
-        except NotImplementedError as e:
-            logger.error("CrewScraper not implemented: %s", e)
+            logger.debug("Fetched crew from isslivenow: %d people", self._cached.count)
         except Exception as e:
             self._consecutive_failures += 1
             logger.warning("CrewScraper failed (%dx): %s", self._consecutive_failures, e)
 
         return self._cached
 
-    def _scrape(self, html: str) -> List[CrewMember]:
-        """Parse the page HTML and return a list of CrewMember.
+    def _parse(self, data: dict) -> List[CrewMember]:
+        """Parse the API JSON response into a list of CrewMember.
 
-        TODO: implement this method.
-
-        Args:
-            html: raw HTML of the page at _SCRAPE_URL
-
-        Returns:
-            list of CrewMember(name=..., craft=...)
-
-        Example:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html, "html.parser")
-            # ... parse and return crew list
+        The exact response structure is unknown — adjust the field names
+        here if the first run logs a parse error.
         """
-        raise NotImplementedError("_scrape() is not yet implemented")
+        crew = []
+        # Try common response shapes — update field names to match actual response
+        people = (
+            data.get("astronauts")
+            or data.get("people")
+            or data.get("crew")
+            or data.get("data")
+            or []
+        )
+        for person in people:
+            name = person.get("name") or person.get("fullName") or person.get("astronautName", "")
+            craft = person.get("craft") or person.get("spacecraft") or person.get("station", "ISS")
+            if name:
+                crew.append(CrewMember(name=name, craft=craft))
+        return crew
 
     def reset_session(self):
         """Close and recreate the HTTP session."""
@@ -92,6 +100,7 @@ class CrewScraper:
         except Exception:
             pass
         self._session = requests.Session()
+        self._session.headers.update(_HEADERS)
 
 
 __all__ = ["CrewScraper"]
