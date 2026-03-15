@@ -290,17 +290,17 @@ class ViewToggle:
     ON (LOW / closed to GND) = ISS tracker view
     OFF (HIGH / open, pulled up) = Crew view
 
-    In preview mode (no GPIO), defaults to ISS view.
+    In preview mode (no GPIO), defaults to the configured DEFAULT_VIEW.
     """
 
     ISS_VIEW = 0
     CREW_VIEW = 1
 
-    def __init__(self, gpio_pin: int, preview_mode: bool):
+    def __init__(self, gpio_pin: int, preview_mode: bool, default_view: str = "iss"):
         self._pin = gpio_pin
         self._preview = preview_mode
-        self._current_view = self.ISS_VIEW
-        self._prev_view = self.ISS_VIEW
+        self._current_view = self.CREW_VIEW if default_view == "crew" else self.ISS_VIEW
+        self._prev_view = self._current_view
 
         if not preview_mode and _HW_AVAILABLE:
             GPIO.setmode(GPIO.BCM)
@@ -308,7 +308,8 @@ class ViewToggle:
             GPIO.setup(self._pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
             logger.info("Toggle switch initialized on GPIO %d", self._pin)
         else:
-            logger.info("Toggle switch: preview mode, defaulting to ISS view")
+            view_name = "CREW" if self._current_view == self.CREW_VIEW else "ISS"
+            logger.info("Toggle switch: no hardware, defaulting to %s view", view_name)
 
     def poll(self) -> int:
         """Read the current switch position. Call from main loop (~100ms)."""
@@ -482,7 +483,7 @@ def run_loop(settings: Settings) -> None:
 
     # Toggle switch: GPIO input, or preview mode fallback
     preview_mode = settings.preview_only or not _HW_AVAILABLE
-    toggle = ViewToggle(settings.gpio_toggle, preview_mode)
+    toggle = ViewToggle(settings.gpio_toggle, preview_mode, settings.default_view)
 
     def signal_handler(sig, frame):
         nonlocal running

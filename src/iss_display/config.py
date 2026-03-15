@@ -33,11 +33,16 @@ class Settings:
     log_level: str
     fb_device: str
     gpio_toggle: int
+    default_view: str  # "iss" or "crew"
 
     @classmethod
     def load(cls) -> "Settings":
         preview_dir = Path(os.getenv("ISS_PREVIEW_DIR", "var/previews")).resolve()
         preview_dir.mkdir(parents=True, exist_ok=True)
+
+        default_view = os.getenv("DEFAULT_VIEW", "iss").strip().lower()
+        if default_view not in ("iss", "crew"):
+            default_view = "iss"
 
         return cls(
             iss_api_url=os.getenv("ISS_API_URL", "https://api.wheretheiss.at/v1/satellites/25544"),
@@ -49,4 +54,5 @@ class Settings:
             log_level=os.getenv("ISS_LOG_LEVEL", "INFO"),
             fb_device=os.getenv("FB_DEVICE", "/dev/fb0"),
             gpio_toggle=int(os.getenv("GPIO_TOGGLE", "17")),
+            default_view=default_view,
         )
