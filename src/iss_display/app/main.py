@@ -296,26 +296,30 @@ class ViewToggle:
     ISS_VIEW = 0
     CREW_VIEW = 1
 
-    def __init__(self, gpio_pin: int, preview_mode: bool, default_view: str = "iss"):
+    def __init__(self, gpio_pin: int, preview_mode: bool, default_view: str = "iss", switch_enabled: bool = True):
         self._pin = gpio_pin
         self._preview = preview_mode
+        self._switch_enabled = switch_enabled
         self._current_view = self.CREW_VIEW if default_view == "crew" else self.ISS_VIEW
         self._prev_view = self._current_view
 
-        if not preview_mode and _HW_AVAILABLE:
+        if switch_enabled and not preview_mode and _HW_AVAILABLE:
             GPIO.setmode(GPIO.BCM)
             GPIO.setwarnings(False)
             GPIO.setup(self._pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
             logger.info("Toggle switch initialized on GPIO %d", self._pin)
         else:
             view_name = "CREW" if self._current_view == self.CREW_VIEW else "ISS"
-            logger.info("Toggle switch: no hardware, defaulting to %s view", view_name)
+            if not switch_enabled:
+                logger.info("Toggle switch disabled, using DEFAULT_VIEW: %s", view_name)
+            else:
+                logger.info("Toggle switch: no hardware, defaulting to %s view", view_name)
 
     def poll(self) -> int:
         """Read the current switch position. Call from main loop (~100ms)."""
         self._prev_view = self._current_view
 
-        if self._preview or not _HW_AVAILABLE:
+        if not self._switch_enabled or self._preview or not _HW_AVAILABLE:
             return self._current_view
 
         try:
@@ -483,7 +487,7 @@ def run_loop(settings: Settings) -> None:
 
     # Toggle switch: GPIO input, or preview mode fallback
     preview_mode = settings.preview_only or not _HW_AVAILABLE
-    toggle = ViewToggle(settings.gpio_toggle, preview_mode, settings.default_view)
+    toggle = ViewToggle(settings.gpio_toggle, preview_mode, settings.default_view, settings.toggle_switch_enabled)
 
     def signal_handler(sig, frame):
         nonlocal running

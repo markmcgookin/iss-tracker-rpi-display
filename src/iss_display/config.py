@@ -33,6 +33,7 @@ class Settings:
     log_level: str
     fb_device: str
     gpio_toggle: int
+    toggle_switch_enabled: bool
     default_view: str  # "iss" or "crew"
 
     @classmethod
@@ -54,5 +55,6 @@ class Settings:
             log_level=os.getenv("ISS_LOG_LEVEL", "INFO"),
             fb_device=os.getenv("FB_DEVICE", "/dev/fb0"),
             gpio_toggle=int(os.getenv("GPIO_TOGGLE", "17")),
+            toggle_switch_enabled=_as_bool(os.getenv("TOGGLE_SWITCH_ENABLED", "true"), default=True),
             default_view=default_view,
         )
