@@ -1,3 +1,6 @@
+# Forked from the original ISS Tracker Display Repo
+This fork is aimed at changing the dispaly to use the (original) 7.5" Respberry pi display
+
 # ISS Tracker Display
 
 A Raspberry Pi-powered display that tracks the International Space Station in real time. It renders a rotating 3D globe with the ISS position and telemetry on a 3.5" LCD, and can show a list of people currently in space.
