@@ -266,6 +266,18 @@ Check the logs: `journalctl --user -u iss-display -f`
 
 ---
 
+## Contributing / Planned Work
+
+This repo is a fork of [filbot/iss-tracker](https://github.com/filbot/iss-tracker), converted to use the official Raspberry Pi 7" display instead of the original Waveshare 3.5" SPI display.
+
+### Planned: SPI display support
+
+The goal is to re-add support for the Waveshare 3.5" SPI display so either hardware can be selected via `DISPLAY_TYPE` in `.env`. A full implementation plan is documented in [`docs/spi-display-support.md`](docs/spi-display-support.md).
+
+Contributions welcome — see the doc for the full breakdown of what needs to change.
+
+---
+
 ## License
 
 [MIT](LICENSE)
