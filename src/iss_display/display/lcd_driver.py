@@ -74,6 +74,9 @@ class FramebufferDisplay:
         finfo = bytearray(68)
         fcntl.ioctl(self._fb, self._FBIOGET_FSCREENINFO, finfo)
         self.line_length = struct.unpack_from('I', finfo, 16)[0]
+        # Some KMS drivers return line_length=0; fall back to calculated value
+        if self.line_length == 0:
+            self.line_length = self.width * (self.bits_per_pixel // 8)
 
         fb_size = self.line_length * self.height
         self._mm = mmap.mmap(self._fb.fileno(), fb_size)
