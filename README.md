@@ -1,5 +1,68 @@
 # Forked from the original ISS Tracker Display Repo
-This fork is aimed at changing the dispaly to use the (original) 7.5" Respberry pi display
+
+This fork adapts the original [filbot/iss-tracker](https://github.com/filbot/iss-tracker) project to work with the **official Raspberry Pi 7" display** instead of the Waveshare 3.5" SPI LCD. Several other improvements and fixes are included.
+
+## What's changed from the original
+
+### Display: SPI → Raspberry Pi 7" framebuffer
+
+The original project used a Waveshare 3.5" SPI LCD (320×480, ST7796S controller) wired onto the GPIO header. This fork replaces that with the official Raspberry Pi 7" touchscreen display (800×480) using the Linux framebuffer (`/dev/fb0`).
+
+**Important:** the app writes directly to the framebuffer, so the Pi must **boot to console** (not desktop). If the Pi boots into the Raspberry Pi OS desktop, the compositor will paint over the display and nothing will appear.
+
+To set console boot:
+```bash
+sudo raspi-config
+# System Options → Boot / Auto Login → Console Autologin
+```
+
+The `FB_DEVICE` env var controls which framebuffer device to use (default `/dev/fb0`).
+
+### Bug fix: framebuffer initialisation on KMS driver
+
+The KMS framebuffer driver on Pi OS Bookworm returns `line_length=0` from the fixed screen info ioctl, which caused `mmap` to fail with `[Errno 22] Invalid argument`. This fork calculates `line_length` from width and bits-per-pixel when the driver reports zero.
+
+### Bug fix: PROJ data directory
+
+Cartopy/pyproj requires the `PROJ_DATA` environment variable to be set when using system Python packages. Add this to your `.env`:
+
+```
+PROJ_DATA=/usr/share/proj
+```
+
+### New setting: `TOGGLE_SWITCH_ENABLED`
+
+The original project assumed a physical toggle switch was always wired to a GPIO pin. If no switch is wired, the floating pin reads as HIGH (crew view), ignoring any intended default.
+
+Set `TOGGLE_SWITCH_ENABLED=false` in `.env` to disable GPIO switch reading entirely. The `DEFAULT_VIEW` setting will be used instead.
+
+### New setting: `DEFAULT_VIEW`
+
+Controls which view is shown on startup when no toggle switch is wired (or when `TOGGLE_SWITCH_ENABLED=false`).
+
+```
+DEFAULT_VIEW=iss    # globe/tracker view (default)
+DEFAULT_VIEW=crew   # people in space view
+```
+
+### New setting: `CREW_SOURCE` + accurate crew data
+
+The original project used [open-notify.org](http://open-notify.org) for people-in-space data, which can be inaccurate or out of date.
+
+Set `CREW_SOURCE=scraper` to use an alternative source ([isslivenow.com](https://isslivenow.com)) which provides up-to-date crew data including each astronaut's launch date.
+
+```
+CREW_SOURCE=api       # open-notify.org, refreshes every 5 min (default)
+CREW_SOURCE=scraper   # isslivenow.com, refreshes every hour
+```
+
+When using `scraper` mode, the crew view shows **days in space** for each crew member instead of the spacecraft name (since all current crew are on the ISS).
+
+### Planned: SPI display support
+
+A plan to re-add optional SPI display support (selectable via `DISPLAY_TYPE=spi`) is documented in [`docs/spi-display-support.md`](docs/spi-display-support.md). Contributions welcome.
+
+---
 
 # ISS Tracker Display
 
