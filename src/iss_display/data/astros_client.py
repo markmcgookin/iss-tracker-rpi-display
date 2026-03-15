@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import requests
@@ -20,6 +20,7 @@ _REFRESH_INTERVAL = 300.0  # 5 minutes
 class CrewMember:
     name: str
     craft: str
+    days_in_space: Optional[int] = None
 
 
 @dataclass(frozen=True)

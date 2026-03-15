@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import date
 from typing import List, Optional
 
 import requests
@@ -75,14 +76,23 @@ class CrewScraper:
         """Parse the API JSON response into a list of CrewMember.
 
         Response shape:
-            {"success": true, "count": 7, "data": {"Key_Name": {"name": "...", ...}, ...}}
+            {"success": true, "count": 7, "data": {"Key_Name": {"name": "...", "launchDate": "YYYY-MM-DD", ...}, ...}}
         All crew are on the ISS so craft is hardcoded.
         """
         crew = []
+        today = date.today()
         for person in data.get("data", {}).values():
             name = person.get("name", "")
-            if name:
-                crew.append(CrewMember(name=name, craft="ISS"))
+            if not name:
+                continue
+            days = None
+            launch_str = person.get("launchDate", "")
+            if launch_str:
+                try:
+                    days = (today - date.fromisoformat(launch_str)).days
+                except ValueError:
+                    pass
+            crew.append(CrewMember(name=name, craft="ISS", days_in_space=days))
         return crew
 
     def reset_session(self):

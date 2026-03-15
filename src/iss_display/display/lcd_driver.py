@@ -468,7 +468,7 @@ class LcdDisplay:
         Returns True if a frame was sent (data changed), False if cached.
         """
         key = f"{astros_data.count}|" + "|".join(
-            f"{c.name}:{c.craft}" for c in astros_data.crew
+            f"{c.name}:{c.craft}:{c.days_in_space}" for c in astros_data.crew
         )
         if key == self._crew_cache_key:
             return False
@@ -500,19 +500,22 @@ class LcdDisplay:
         draw.line([margin, line2_y, W - margin, line2_y], fill=color, width=1)
 
         # ── Section 3: Column headers ──
+        has_days = any(c.days_in_space is not None for c in astros_data.crew)
         hdr_y = line2_y + sp + 2
         draw.text((margin + 2, hdr_y), "CREW MEMBER",
                   fill=color, font=self._crew_header_font)
-        craft_hdr = "CRAFT"
-        bbox = draw.textbbox((0, 0), craft_hdr, font=self._crew_header_font)
-        craft_hdr_w = bbox[2] - bbox[0]
-        draw.text((W - margin - 2 - craft_hdr_w, hdr_y), craft_hdr,
+        right_hdr = "DAYS" if has_days else "CRAFT"
+        bbox = draw.textbbox((0, 0), right_hdr, font=self._crew_header_font)
+        right_hdr_w = bbox[2] - bbox[0]
+        draw.text((W - margin - 2 - right_hdr_w, hdr_y), right_hdr,
                   fill=color, font=self._crew_header_font)
         line3_y = hdr_y + 18 + sp
         draw.line([margin, line3_y, W - margin, line3_y], fill=color, width=1)
 
         # ── Section 4: Crew table ──
         # Group by craft, sort names alphabetically, ISS first
+        # Build a lookup from name → days_in_space for quick access
+        days_lookup = {m.name: m.days_in_space for m in astros_data.crew}
         crafts: dict[str, list[str]] = {}
         for member in astros_data.crew:
             crafts.setdefault(member.craft, []).append(member.name)
@@ -536,8 +539,6 @@ class LcdDisplay:
 
             members = crafts[craft_name]
             craft_label = craft_name.upper()
-            bbox = draw.textbbox((0, 0), craft_label, font=self._crew_list_font)
-            craft_w = bbox[2] - bbox[0]
 
             for name in members:
                 if y + line_h > bottom_zone:
@@ -545,9 +546,13 @@ class LcdDisplay:
                               fill=color, font=self._crew_list_font)
                     y += line_h
                     break
+                days = days_lookup.get(name)
+                right_label = f"{days}D" if days is not None else craft_label
+                bbox = draw.textbbox((0, 0), right_label, font=self._crew_list_font)
+                right_w = bbox[2] - bbox[0]
                 draw.text((margin + 2, y), name.upper(),
                           fill=color, font=self._crew_list_font)
-                draw.text((W - margin - 2 - craft_w, y), craft_label,
+                draw.text((W - margin - 2 - right_w, y), right_label,
                           fill=color, font=self._crew_list_font)
                 y += line_h
 
