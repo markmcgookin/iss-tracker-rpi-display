@@ -74,23 +74,15 @@ class CrewScraper:
     def _parse(self, data: dict) -> List[CrewMember]:
         """Parse the API JSON response into a list of CrewMember.
 
-        The exact response structure is unknown — adjust the field names
-        here if the first run logs a parse error.
+        Response shape:
+            {"success": true, "count": 7, "data": {"Key_Name": {"name": "...", ...}, ...}}
+        All crew are on the ISS so craft is hardcoded.
         """
         crew = []
-        # Try common response shapes — update field names to match actual response
-        people = (
-            data.get("astronauts")
-            or data.get("people")
-            or data.get("crew")
-            or data.get("data")
-            or []
-        )
-        for person in people:
-            name = person.get("name") or person.get("fullName") or person.get("astronautName", "")
-            craft = person.get("craft") or person.get("spacecraft") or person.get("station", "ISS")
+        for person in data.get("data", {}).values():
+            name = person.get("name", "")
             if name:
-                crew.append(CrewMember(name=name, craft=craft))
+                crew.append(CrewMember(name=name, craft="ISS"))
         return crew
 
     def reset_session(self):
