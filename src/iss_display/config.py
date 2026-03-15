@@ -35,6 +35,7 @@ class Settings:
     gpio_toggle: int
     toggle_switch_enabled: bool
     default_view: str  # "iss" or "crew"
+    crew_source: str   # "api" or "scraper"
 
     @classmethod
     def load(cls) -> "Settings":
@@ -44,6 +45,10 @@ class Settings:
         default_view = os.getenv("DEFAULT_VIEW", "iss").strip().lower()
         if default_view not in ("iss", "crew"):
             default_view = "iss"
+
+        crew_source = os.getenv("CREW_SOURCE", "api").strip().lower()
+        if crew_source not in ("api", "scraper"):
+            crew_source = "api"
 
         return cls(
             iss_api_url=os.getenv("ISS_API_URL", "https://api.wheretheiss.at/v1/satellites/25544"),
@@ -57,4 +62,5 @@ class Settings:
             gpio_toggle=int(os.getenv("GPIO_TOGGLE", "17")),
             toggle_switch_enabled=_as_bool(os.getenv("TOGGLE_SWITCH_ENABLED", "true"), default=True),
             default_view=default_view,
+            crew_source=crew_source,
         )

@@ -17,6 +17,7 @@ from iss_display.config import Settings
 from iss_display.display.lcd_driver import LcdDisplay
 from iss_display.data.iss_client import ISSClient, ISSFetchError, ISSFix
 from iss_display.data.astros_client import AstrosClient
+from iss_display.data.crew_scraper import CrewScraper
 
 try:
     import RPi.GPIO as GPIO
@@ -469,7 +470,12 @@ class DisplayRenderer(threading.Thread):
 
 def run_loop(settings: Settings) -> None:
     iss_client = ISSClient(settings)
-    astros_client = AstrosClient()
+    if settings.crew_source == "scraper":
+        astros_client = CrewScraper()
+        logger.info("Crew source: custom web scraper")
+    else:
+        astros_client = AstrosClient()
+        logger.info("Crew source: open-notify API")
     driver = LcdDisplay(settings)
 
     interpolator = ISSOrbitInterpolator(iss_client, api_interval=30.0)
