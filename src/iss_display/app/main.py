@@ -294,8 +294,8 @@ class ViewToggle:
     In preview mode (no GPIO), defaults to the configured DEFAULT_VIEW.
     """
 
-    ISS_VIEW = 1
-    CREW_VIEW = 0
+    ISS_VIEW = 0
+    CREW_VIEW = 1
 
     def __init__(self, gpio_pin: int, preview_mode: bool, default_view: str = "iss", switch_enabled: bool = True):
         self._pin = gpio_pin
