@@ -327,7 +327,7 @@ class ViewToggle:
             pin_state = GPIO.input(self._pin)
             # LOW (0) = switch closed to GND = ISS view
             # HIGH (1) = switch open, pulled up = Crew view
-            self._current_view = self.CREW_VIEW if pin_state else self.ISS_VIEW
+            self._current_view = self.ISS_VIEW if pin_state else self.CREW_VIEW
         except Exception as e:
             logger.warning("Toggle switch read failed: %s", e)
 
