@@ -331,8 +331,6 @@ class ViewToggle:
         except Exception as e:
             logger.warning("Toggle switch read failed: %s", e)
 
-        print("ViewToggle.poll: current_view=%d, prev_view=%d" % (self._current_view, self._prev_view))
-
         return self._current_view
 
     def view_changed(self) -> bool:
@@ -535,8 +533,6 @@ def run_loop(settings: Settings) -> None:
 
             # Poll toggle switch
             current_view = toggle.poll()
-
-            print("current_view" + str(current_view))
 
             if toggle.view_changed():
                 view_name = "ISS" if current_view == ViewToggle.ISS_VIEW else "CREW"
