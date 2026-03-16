@@ -518,11 +518,11 @@ def run_loop(settings: Settings) -> None:
 
         # Read toggle state BEFORE starting renderer to avoid ISS view flash
         initial_view = toggle.poll()
-        if initial_view == ViewToggle.CREW_VIEW:
-            renderer.set_view(ViewToggle.CREW_VIEW)
+        if initial_view == ViewToggle.ISS_VIEW:
+            renderer.set_view(ViewToggle.ISS_VIEW)
             crew_data = astros_client.get_astros()
             renderer.set_crew_data(crew_data)
-            logger.info("Starting in CREW view (toggle switch off)")
+            logger.info("Starting in ISS view (toggle switch off)")
 
         renderer.start()
 
